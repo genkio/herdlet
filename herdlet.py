@@ -24,7 +24,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 DEFAULT_SOCK = os.environ.get("HERDLET_SOCKET", os.path.expanduser("~/.herdlet.sock"))
 LOG_PATH = os.path.expanduser("~/.herdlet.log")
@@ -127,7 +127,7 @@ async def _handle_client(reader, writer, bus):
                     continue
                 event = bus.report(agent_id, params)
                 _log("report", agent_id, event["state"], event.get("message") or "")
-                _send(writer, {"id": rid, "result": {"type": "reported", **event}})
+                _send(writer, {"id": rid, "result": {**event, "type": "reported"}})
 
             elif method == "agent.get":
                 snap = bus.snapshot(params.get("id"))
@@ -146,7 +146,7 @@ async def _handle_client(reader, writer, bus):
                     _send(writer, {"id": rid, "error": {"code": "not_found"}})
                 else:
                     _log("remove", params.get("id"))
-                    _send(writer, {"id": rid, "result": {"type": "removed", **event}})
+                    _send(writer, {"id": rid, "result": {**event, "type": "removed"}})
 
             elif method == "wait":
                 await _handle_wait(writer, bus, rid, params)
@@ -185,7 +185,7 @@ async def _handle_wait(writer, bus, rid, params):
     timeout = params.get("timeout_ms")
     try:
         event = await asyncio.wait_for(fut, timeout / 1000.0 if timeout else None)
-        _send(writer, {"id": rid, "result": {"type": "waited", "already": False, **event}})
+        _send(writer, {"id": rid, "result": {**event, "type": "waited", "already": False}})
     except asyncio.TimeoutError:
         _send(writer, {"id": rid, "error": {"code": "timeout", "agent": agent_id, "states": states}})
     finally:

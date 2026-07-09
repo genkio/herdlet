@@ -53,8 +53,9 @@ class HerdletTest(unittest.TestCase):
         self.assertEqual(resp["result"]["type"], "pong")
 
     def test_report_get_merge(self):
-        self.parse(self.run_cli("report", "--id", "m1", "--state", "working",
-                                "--message", "npm test", "--agent", "claude"))
+        resp = self.parse(self.run_cli("report", "--id", "m1", "--state", "working",
+                                       "--message", "npm test", "--agent", "claude"))
+        self.assertEqual(resp["result"]["type"], "reported")
         # absent message preserves, state updates
         self.parse(self.run_cli("report", "--id", "m1", "--state", "done"))
         rec = self.parse(self.run_cli("get", "--id", "m1"))["result"]
@@ -90,6 +91,7 @@ class HerdletTest(unittest.TestCase):
         resp = self.parse(self.run_cli("wait", "--id", "w2", "--state", "done", "--timeout", "5"))
         elapsed = time.time() - start
         timer.join()
+        self.assertEqual(resp["result"]["type"], "waited")
         self.assertFalse(resp["result"]["already"])
         self.assertGreaterEqual(elapsed, 0.3)
         self.assertLess(elapsed, 4)
