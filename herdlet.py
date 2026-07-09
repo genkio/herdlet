@@ -24,7 +24,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 DEFAULT_SOCK = os.environ.get("HERDLET_SOCKET", os.path.expanduser("~/.herdlet.sock"))
 LOG_PATH = os.path.expanduser("~/.herdlet.log")
@@ -556,7 +556,7 @@ def draw(agents, note):
                 f"{rec['age'].rjust(3)}  {DIM}{rec['where'].ljust(where_w)}{RESET}  "
                 f"{rec.get('message') or ''}")
         out.append(line[:cols + len(line) - len_visible(line)] + RESET + "\n")
-    out.append(f"\n {DIM}q quit · 1-9 jump to pane{RESET}")
+    out.append(f"\n {DIM}q or esc quit · 1-9 jump to pane{RESET}")
     if note:
         out.append(f"  {COLORS['blocked']}{note}{RESET}")
     sys.stdout.write("".join(out))
@@ -593,11 +593,25 @@ def cmd_monitor(args):
         while True:
             if not _monitor_session(args.socket, fd):
                 return 0
-            time.sleep(1)  # daemon dropped; retry
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         sys.stdout.write("\033[?25h\033[?1049l")
         sys.stdout.flush()
+
+
+QUIT_KEYS = ("q", "Q", "\x1b", "\x03")  # esc also catches arrow-key prefixes; fine, monitor has no arrows
+
+
+def _quit_pressed(stdin_fd, timeout):
+    import selectors
+
+    sel = selectors.DefaultSelector()
+    sel.register(stdin_fd, selectors.EVENT_READ)
+    ready = sel.select(timeout=timeout)
+    sel.close()
+    if not ready:
+        return False
+    return os.read(stdin_fd, 1).decode(errors="replace") in QUIT_KEYS
 
 
 def _monitor_session(sock_path, stdin_fd):
@@ -611,7 +625,7 @@ def _monitor_session(sock_path, stdin_fd):
         conn.send((json.dumps({"id": "m", "method": "subscribe", "params": {}}) + "\n").encode())
     except OSError:
         draw([], "daemon not running, retrying...")
-        return True
+        return not _quit_pressed(stdin_fd, 1.0)  # keep keys live while down, and pace the retry
 
     sel = selectors.DefaultSelector()
     sel.register(conn, selectors.EVENT_READ)
@@ -635,7 +649,7 @@ def _monitor_session(sock_path, stdin_fd):
             for key, _ in events:
                 if key.fileobj == stdin_fd:
                     ch = os.read(stdin_fd, 1).decode(errors="replace")
-                    if ch in ("q", "\x03"):
+                    if ch in QUIT_KEYS:
                         return False
                     if ch.isdigit() and 0 < int(ch) <= len(agents):
                         if jump(agents[int(ch) - 1], pane_map()):
