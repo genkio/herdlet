@@ -97,8 +97,13 @@ bind m display-popup -E -w 80% -h 60% -T " agents " "herdlet monitor"
 
 ## Agent-to-agent orchestration
 
-Give your agents the included [SKILL.md](SKILL.md) (drop it in
-`~/.claude/skills/herdlet/`) and they can coordinate themselves:
+Give your agents the included [skill](skills/herdlet/SKILL.md) and they can
+coordinate themselves:
+
+```bash
+npx skills add genkio/herdlet        # Claude Code, Codex, Cursor, ...
+# or manually: cp skills/herdlet/SKILL.md ~/.claude/skills/herdlet/
+```
 
 ```bash
 # spawn a worker in a new pane, wait for it, read its result
