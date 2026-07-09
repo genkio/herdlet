@@ -32,10 +32,6 @@ STATES = ("idle", "working", "blocked", "done", "unknown")
 MERGE_KEYS = ("message", "agent", "pane", "cwd")
 
 
-# --------------------------------------------------------------------------
-# daemon
-# --------------------------------------------------------------------------
-
 class Bus:
     def __init__(self):
         self.agents = {}       # id -> record
@@ -264,10 +260,6 @@ def cmd_serve(args):
     return 0
 
 
-# --------------------------------------------------------------------------
-# client plumbing
-# --------------------------------------------------------------------------
-
 def call(sock_path, method, params, timeout=5.0):
     conn = socket.socket(socket.AF_UNIX)
     conn.settimeout(timeout)
@@ -323,10 +315,6 @@ def squash(text, limit=120):
     return " ".join(str(text).split())[:limit]
 
 
-# --------------------------------------------------------------------------
-# tmux glue
-# --------------------------------------------------------------------------
-
 def tmux(*args, check=False):
     try:
         out = subprocess.run(("tmux",) + args, capture_output=True, text=True, timeout=5)
@@ -365,10 +353,6 @@ def resolve_pane(sock_path, agent_id):
         return agent_id
     die(f"unknown agent '{agent_id}' (see: herdlet list)")
 
-
-# --------------------------------------------------------------------------
-# subcommands
-# --------------------------------------------------------------------------
 
 def cmd_ping(args):
     emit(call_or_die(args.socket, "ping", {}))
@@ -549,10 +533,6 @@ def cmd_peek(args):
     print(out.rstrip("\n"))
 
 
-# --------------------------------------------------------------------------
-# monitor
-# --------------------------------------------------------------------------
-
 COLORS = {"working": "\033[33m", "blocked": "\033[1;31m", "done": "\033[32m",
           "idle": "\033[2m", "unknown": "\033[2m", "gone": "\033[35m"}
 RESET = "\033[0m"
@@ -670,10 +650,6 @@ def _monitor_session(sock_path, stdin_fd):
         sel.close()
         conn.close()
 
-
-# --------------------------------------------------------------------------
-# cli
-# --------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
