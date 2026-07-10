@@ -25,9 +25,16 @@ Single file, stdlib only, no dependencies beyond python3 and tmux.
 
 ```bash
 brew install genkio/tap/herdlet
+herdlet setup                # wire hooks + skill + permissions, one time
 ```
 
 Or just drop `herdlet.py` somewhere on your PATH.
+
+`herdlet setup` wires the Claude Code / Codex hooks (backing up the settings
+files it touches), installs the agent skill, and allowlists `Bash(herdlet:*)`.
+Add `--allow-tmux` if agents should also spawn panes unprompted. It is
+idempotent and leaves everything else in your settings alone. Prefer manual
+wiring? The snippets are below.
 
 There is no daemon to babysit: `hook`, `report` and `monitor` auto-start it
 on first use (`herdlet serve` runs it in the foreground if you prefer).
@@ -42,6 +49,8 @@ herdlet list
 
 herdlet wait --id builder --state done,blocked --timeout 600   # push-woken, no polling
 herdlet watch                                    # stream every state change as JSON lines
+herdlet list --here                              # scope to the current tmux session
+herdlet list --prefix myproject/                 # scope to one project's agents
 
 herdlet send --id builder "run the tests again"  # types into builder's pane + Enter
 herdlet peek --id builder --lines 40             # read builder's recent output
@@ -68,8 +77,9 @@ never blocks, and always exits 0, so it is safe in any hook chain.
 The prompt text becomes the agent's `message`, so `list` / `monitor` show
 what each agent is working on.
 
-Claude Code `settings.json` (same pattern for Codex `hooks.json`, with
-`--agent codex`):
+`herdlet setup` wires all of this for you; the snippets below are the manual
+reference. Claude Code `settings.json` (same pattern for Codex `hooks.json`,
+with `--agent codex`):
 
 ```json
 {
@@ -94,6 +104,50 @@ agent's pane, `q` to quit. Wire it to a tmux popup:
 ```tmux
 bind m display-popup -E -w 80% -h 60% -T " agents " "herdlet monitor"
 ```
+
+## Layout: sessions are domains, windows are projects, panes are roles
+
+herdlet's namespace is global (one bus per machine), so structure comes from
+two conventions, not infrastructure:
+
+```
+session "work"                      session "personal"
+├── window 0: master  <- you        ├── window 0: master  <- you
+├── window 1: billing-api           ├── window 1: herdlet
+│   ├── work/billing/planner       │   ├── personal/herdlet/dev
+│   ├── work/billing/dev           │   └── personal/herdlet/tester
+│   └── work/billing/tester        └── window 2: genkia
+└── window 2: admin-ui                  └── personal/genkia/dev
+```
+
+- **One tmux session per domain** (work, personal, ...). Each domain gets a
+  long-lived **master**: an interactive agent in window 0 that you talk to.
+- **One window per project**, **one pane per role**, spawned by the master on
+  demand.
+- **Name agents `project/role`** via `HERDLET_ID`. Names are the only thing
+  that can collide across projects; the prefix makes them unique, and
+  `herdlet list --prefix herdlet/` or `--here` keeps discovery scoped.
+  Unnamed agents fall back to their pane id, which never collides.
+
+A master's turn looks like: you say "let's work on herdlet: spin up a dev and
+a tester, requirement is ...", and it runs
+
+```bash
+tmux new-window -t personal -n herdlet -c ~/code/herdlet
+tmux split-window -h -t personal:herdlet
+tmux send-keys -t personal:herdlet.0 "HERDLET_ID=personal/herdlet/dev claude" Enter
+tmux send-keys -t personal:herdlet.1 "HERDLET_ID=personal/herdlet/tester claude" Enter
+```
+
+then drives the pair with `send` / `wait --state done,blocked` / `peek`,
+relaying between roles and reporting back to you. Hours later, "now genkia"
+just means a new window; the herdlet window keeps existing and its agents show
+`idle` in the monitor. Two masters never interfere: each spawns only into its
+own session and its own id prefixes. Scope each domain's popup with
+`herdlet monitor --session work`.
+
+Masters shell out to `tmux` and `herdlet` constantly, so either run
+`herdlet setup --allow-tmux` or expect to approve every step by hand.
 
 ## Agent-to-agent orchestration
 

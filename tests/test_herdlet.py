@@ -169,6 +169,65 @@ class HerdletTest(unittest.TestCase):
         proc = self.run_cli("serve", "--if-needed")
         self.assertEqual(proc.returncode, 0)
 
+    def test_list_prefix_filter(self):
+        self.parse(self.run_cli("report", "--id", "px/one", "--state", "idle"))
+        self.parse(self.run_cli("report", "--id", "px-other", "--state", "idle"))
+        proc = self.run_cli("list", "--json", "--prefix", "px/")
+        ids = [a["id"] for a in json.loads(proc.stdout)]
+        self.assertEqual(ids, ["px/one"])
+
+    def test_setup_idempotent(self):
+        with tempfile.TemporaryDirectory() as home:
+            env = {"HOME": home}
+            proc = self.run_cli("setup", "--allow-tmux", env_extra=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            with open(os.path.join(home, ".claude", "settings.json")) as fh:
+                cfg = json.load(fh)
+            for event in ("SessionStart", "SessionEnd", "UserPromptSubmit",
+                          "PostToolUse", "Notification", "Stop"):
+                commands = [h["command"] for g in cfg["hooks"][event] for h in g["hooks"]]
+                self.assertTrue(any("herdlet hook" in c for c in commands), event)
+            matchers = [g.get("matcher") for g in cfg["hooks"]["Notification"]]
+            self.assertIn("permission_prompt|elicitation_dialog", matchers)
+            self.assertIn("Bash(herdlet:*)", cfg["permissions"]["allow"])
+            self.assertIn("Bash(tmux:*)", cfg["permissions"]["allow"])
+
+            with open(os.path.join(home, ".codex", "hooks.json")) as fh:
+                codex = json.load(fh)
+            self.assertIn("--agent codex --event Stop",
+                          codex["hooks"]["Stop"][0]["hooks"][0]["command"])
+            self.assertTrue(os.path.exists(
+                os.path.join(home, ".claude", "skills", "herdlet", "SKILL.md")))
+            self.assertTrue(os.path.exists(
+                os.path.join(home, ".codex", "skills", "herdlet", "SKILL.md")))
+
+            with open(os.path.join(home, ".claude", "settings.json")) as fh:
+                before = fh.read()
+            proc = self.run_cli("setup", "--allow-tmux", env_extra=env)
+            self.assertEqual(proc.returncode, 0)
+            self.assertIn("already wired", proc.stdout)
+            with open(os.path.join(home, ".claude", "settings.json")) as fh:
+                self.assertEqual(fh.read(), before)
+
+    def test_setup_preserves_existing_hooks(self):
+        with tempfile.TemporaryDirectory() as home:
+            claude_dir = os.path.join(home, ".claude")
+            os.makedirs(claude_dir)
+            existing = {"model": "opus", "hooks": {"Stop": [
+                {"hooks": [{"type": "command", "command": "my-other-hook.sh"}]}]}}
+            with open(os.path.join(claude_dir, "settings.json"), "w") as fh:
+                json.dump(existing, fh)
+            self.run_cli("setup", env_extra={"HOME": home})
+            with open(os.path.join(claude_dir, "settings.json")) as fh:
+                cfg = json.load(fh)
+            self.assertEqual(cfg["model"], "opus")
+            stop_cmds = [h["command"] for g in cfg["hooks"]["Stop"] for h in g["hooks"]]
+            self.assertIn("my-other-hook.sh", stop_cmds)
+            self.assertTrue(any("herdlet hook" in c for c in stop_cmds))
+            self.assertTrue(os.path.exists(
+                os.path.join(claude_dir, "settings.json.herdlet-bak")))
+
 
 if __name__ == "__main__":
     unittest.main()

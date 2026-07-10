@@ -24,7 +24,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.1.3"
+__version__ = "0.2.0"
 
 DEFAULT_SOCK = os.environ.get("HERDLET_SOCKET", os.path.expanduser("~/.herdlet.sock"))
 LOG_PATH = os.path.expanduser("~/.herdlet.log")
@@ -412,13 +412,27 @@ def annotate(agents, panes):
     return agents
 
 
+def filter_agents(agents, session=None, here=False, prefix=None):
+    if here:
+        pane = os.environ.get("TMUX_PANE")
+        if not pane:
+            die("--here requires running inside tmux")
+        session = (tmux("display-message", "-p", "-t", pane,
+                        "#{session_name}", check=True) or "").strip()
+    if session:
+        agents = [a for a in agents if a["where"].split(":")[0] == session]
+    if prefix:
+        agents = [a for a in agents if a["id"].startswith(prefix)]
+    return agents
+
+
 def cmd_list(args):
     resp = call_or_die(args.socket, "agent.list", {})
-    agents = resp.get("result", {}).get("agents", [])
+    agents = annotate(resp.get("result", {}).get("agents", []), pane_map())
+    agents = filter_agents(agents, args.session, args.here, args.prefix)
     if args.json:
         print(json.dumps(agents, indent=2))
         return
-    agents = annotate(agents, pane_map())
     if not agents:
         print("no agents registered")
         return
@@ -475,6 +489,104 @@ HOOK_STATES = {
     "PermissionRequest": "blocked",
     "Stop": "done",
 }
+
+HOOK_CMD = "command -v herdlet >/dev/null 2>&1 && herdlet hook || true"
+CODEX_HOOK_CMD = ("command -v herdlet >/dev/null 2>&1 && "
+                  "herdlet hook --agent codex --event {event} || true")
+NOTIFY_MATCHER = "permission_prompt|elicitation_dialog"
+CLAUDE_EVENTS = ("SessionStart", "SessionEnd", "UserPromptSubmit",
+                 "PostToolUse", "Notification", "Stop")
+CODEX_EVENTS = ("UserPromptSubmit", "PreToolUse", "PermissionRequest", "Stop")
+
+
+def _load_json(path):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        die(f"{path} is not valid JSON; fix or move it aside first")
+
+
+def _save_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        shutil.copy2(path, path + ".herdlet-bak")
+    # open for write (not replace) so stow/dotfiles symlinks stay symlinks
+    with open(path, "w") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+
+
+def _wire_hooks(cfg, events, command_for, matcher_for):
+    hooks = cfg.setdefault("hooks", {})
+    added = []
+    for event in events:
+        groups = hooks.setdefault(event, [])
+        if any("herdlet hook" in h.get("command", "")
+               for g in groups for h in g.get("hooks", [])):
+            continue
+        group = {"hooks": [{"type": "command", "command": command_for(event)}]}
+        matcher = matcher_for(event)
+        if matcher:
+            group["matcher"] = matcher
+        groups.append(group)
+        added.append(event)
+    return added
+
+
+def _skill_source():
+    here = os.path.dirname(os.path.realpath(__file__))
+    for cand in (os.path.join(here, "skills", "herdlet", "SKILL.md"),
+                 os.path.normpath(os.path.join(here, "..", "share", "doc",
+                                               "herdlet", "SKILL.md"))):
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+def _install_skill(dest_dir):
+    dest = os.path.join(dest_dir, "herdlet", "SKILL.md")
+    if os.path.lexists(dest):
+        return f"{dest}: already present, skipped"
+    source = _skill_source()
+    if source is None:
+        return "SKILL.md not found next to this install, skipped"
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.copyfile(source, dest)
+    return f"{dest}: installed"
+
+
+def cmd_setup(args):
+    home = os.path.expanduser("~")
+
+    path = os.path.join(home, ".claude", "settings.json")
+    cfg = _load_json(path)
+    added = _wire_hooks(cfg, CLAUDE_EVENTS, lambda e: HOOK_CMD,
+                        lambda e: NOTIFY_MATCHER if e == "Notification" else None)
+    allow = cfg.setdefault("permissions", {}).setdefault("allow", [])
+    rules = ["Bash(herdlet:*)"] + (["Bash(tmux:*)"] if args.allow_tmux else [])
+    new_rules = [r for r in rules if r not in allow]
+    allow.extend(new_rules)
+    if added or new_rules:
+        _save_json(path, cfg)
+    print(f"claude hooks : {'wired ' + ', '.join(added) if added else 'already wired'}")
+    print(f"claude perms : {'allowed ' + ', '.join(new_rules) if new_rules else 'already allowed'}")
+
+    path = os.path.join(home, ".codex", "hooks.json")
+    cfg = _load_json(path)
+    added = _wire_hooks(cfg, CODEX_EVENTS,
+                        lambda e: CODEX_HOOK_CMD.format(event=e), lambda e: None)
+    if added:
+        _save_json(path, cfg)
+    print(f"codex hooks  : {'wired ' + ', '.join(added) if added else 'already wired'}")
+
+    print(f"claude skill : {_install_skill(os.path.join(home, '.claude', 'skills'))}")
+    print(f"codex skill  : {_install_skill(os.path.join(home, '.codex', 'skills'))}")
+    print("\nrunning agent sessions pick this up on restart. optional tmux popup:")
+    print('  bind m display-popup -E -w 80% -h 60% -T " agents " "herdlet monitor"')
+    return 0
 
 
 def cmd_hook(args):
@@ -591,7 +703,7 @@ def cmd_monitor(args):
     try:
         tty.setcbreak(fd)
         while True:
-            if not _monitor_session(args.socket, fd):
+            if not _monitor_session(args.socket, fd, args.session, args.prefix):
                 return 0
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
@@ -614,7 +726,7 @@ def _quit_pressed(stdin_fd, timeout):
     return os.read(stdin_fd, 1).decode(errors="replace") in QUIT_KEYS
 
 
-def _monitor_session(sock_path, stdin_fd):
+def _monitor_session(sock_path, stdin_fd, session=None, prefix=None):
     """One connected stretch. Returns False to quit, True to reconnect."""
     import selectors
 
@@ -636,7 +748,9 @@ def _monitor_session(sock_path, stdin_fd):
         nonlocal agents
         try:
             resp = call(sock_path, "agent.list", {}, timeout=2.0)
-            agents = annotate(resp.get("result", {}).get("agents", []), pane_map())
+            agents = filter_agents(
+                annotate(resp.get("result", {}).get("agents", []), pane_map()),
+                session, prefix=prefix)
         except OSError:
             pass
         draw(agents, "")
@@ -694,6 +808,9 @@ def main():
 
     p = sub.add_parser("list", help="list registered agents")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--session", help="only agents in this tmux session")
+    p.add_argument("--here", action="store_true", help="only agents in the current tmux session")
+    p.add_argument("--prefix", help="only ids starting with this prefix, e.g. myproject/")
     p.set_defaults(fn=cmd_list)
 
     p = sub.add_parser("remove", help="remove an agent from the registry")
@@ -729,7 +846,14 @@ def main():
     p.set_defaults(fn=cmd_peek)
 
     p = sub.add_parser("monitor", help="live status view (made for a tmux popup)")
+    p.add_argument("--session", help="only agents in this tmux session")
+    p.add_argument("--prefix", help="only ids starting with this prefix")
     p.set_defaults(fn=cmd_monitor)
+
+    p = sub.add_parser("setup", help="wire Claude Code / Codex hooks, permissions and the skill")
+    p.add_argument("--allow-tmux", action="store_true",
+                   help="also allow Bash(tmux:*) so agents can spawn worker panes unprompted")
+    p.set_defaults(fn=cmd_setup)
 
     args = parser.parse_args()
     try:

@@ -31,16 +31,24 @@ normally never report your own state.
 **ids**: an agent's id is `$HERDLET_ID` if it was launched with one,
 otherwise its tmux pane id like `%5`. ids come from `herdlet list`; do not
 guess them. when you spawn a worker, name it via the env var so you can
-address it.
+address it. the namespace is machine-global, so name workers `project/role`
+(e.g. `herdlet/tester`); a bare name like `dev` collides the moment a second
+project uses it, and the newer registration silently steals the id.
 
 **your own id**: `$HERDLET_ID` if set, else `$TMUX_PANE`.
+
+**layout convention**: one tmux session per domain (work, personal), one
+window per project, one pane per role. stay inside your own session and your
+own id prefix unless explicitly asked to reach further.
 
 ## discover the herd
 
 ```bash
-herdlet list          # table: id, state, age, agent, pane, where, message
-herdlet list --json   # same, machine-readable
-herdlet get --id builder
+herdlet list                    # everyone, everywhere on this machine
+herdlet list --here             # only agents in your tmux session (prefer this)
+herdlet list --prefix herdlet/  # only one project's agents
+herdlet list --json             # machine-readable
+herdlet get --id herdlet/tester
 ```
 
 a state of `gone` means the agent's pane no longer exists.
@@ -60,6 +68,16 @@ herdlet wait --id builder --state done,blocked --timeout 600
 
 exit code 0 = state reached (`result.state` says which), 2 = timeout. always
 pass `--timeout`. after waking, `peek` to see what actually happened.
+
+if your shell tool has its own timeout (Claude Code's Bash defaults to 2
+minutes), wait in chunks instead of one long block:
+
+```bash
+while true; do
+  herdlet wait --id herdlet/dev --state done,blocked --timeout 90 && break
+  [ $? -eq 2 ] || break   # 2 = chunk timed out, keep waiting; anything else, stop
+done
+```
 
 ## read a neighbor's output
 
@@ -90,6 +108,27 @@ herdlet peek --id worker --lines 40
 
 interactive workers are the same without `-p`; after they register you drive
 them with `send` / `wait` / `peek` cycles.
+
+## act as a master orchestrator
+
+if the user asks you to manage a project (or several), you are the master:
+a long-lived agent in window 0 of a domain session. per project, create one
+window with one pane per role, then relay work between them:
+
+```bash
+tmux new-window -t personal -n herdlet -c ~/code/herdlet
+tmux split-window -h -t personal:herdlet
+tmux send-keys -t personal:herdlet.0 "HERDLET_ID=personal/herdlet/dev claude" Enter
+tmux send-keys -t personal:herdlet.1 "HERDLET_ID=personal/herdlet/tester claude" Enter
+herdlet wait --id personal/herdlet/dev --state idle --timeout 30   # registered?
+```
+
+then loop: `send` a role its task, chunked `wait --state done,blocked`,
+`peek` for the outcome, pass results to the next role, report to the user.
+relay `peek` summaries, not whole transcripts, to keep your own context small.
+if a worker goes `blocked`, tell the user who is stuck and on what instead of
+waiting silently. switching projects means a new window; leave finished
+windows alive so the user can inspect them.
 
 ## report state manually
 
