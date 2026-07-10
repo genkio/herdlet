@@ -132,9 +132,33 @@ agent run entirely; set it when a hook or script of yours shells out to
 then loop: `send` a role its task, chunked `wait --state done,blocked`,
 `peek` for the outcome, pass results to the next role, report to the user.
 relay `peek` summaries, not whole transcripts, to keep your own context small.
-if a worker goes `blocked`, tell the user who is stuck and on what instead of
-waiting silently. switching projects means a new window; leave finished
-windows alive so the user can inspect them.
+switching projects means a new window; leave finished windows alive so the
+user can inspect them.
+
+## unblock a worker (questions and permission prompts)
+
+a `blocked` worker is sitting on a permission menu; a `done` worker may have
+ended its turn by asking you something. either way `peek` first, then:
+
+- **question in plain text**: answer it like a user would:
+  `herdlet send --id herdlet/dev "yes, proceed with both releases"`
+- **permission menu** (numbered options): menus react to a single keypress,
+  so use tmux directly; `send` would append Enter:
+
+  ```bash
+  tmux send-keys -t %5 1        # approve once (pane id from herdlet list)
+  tmux send-keys -t %5 3        # deny; then `send` a corrective instruction
+  tmux send-keys -t %5 Escape   # dismiss a dialog
+  ```
+
+rules of thumb: approve only what matches the task you assigned; deny with a
+follow-up instruction if the action looks off-task; escalate to the human
+instead of guessing on anything destructive, irreversible, or outward-facing
+(pushes, publishes, deletes). avoid "always allow" menu options unless the
+human said so, they persist beyond this task. a denied permission fires no
+hook, so after answering a menu re-check with `get` rather than `wait`. for
+trusted bulk work, cut the prompt noise at spawn time instead:
+`claude --permission-mode acceptEdits`.
 
 ## report state manually
 
