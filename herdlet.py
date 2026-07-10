@@ -16,7 +16,6 @@ import argparse
 import asyncio
 import json
 import os
-import re
 import shutil
 import signal
 import socket
@@ -24,7 +23,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 DEFAULT_SOCK = os.environ.get("HERDLET_SOCKET", os.path.expanduser("~/.herdlet.sock"))
 LOG_PATH = os.path.expanduser("~/.herdlet.log")
@@ -656,6 +655,12 @@ DIM = "\033[2m"
 BOLD = "\033[1m"
 
 
+def clip(text, width):
+    if len(text) <= width:
+        return text
+    return text[:max(0, width - 1)] + "…"
+
+
 def draw(agents, note):
     cols, lines = shutil.get_terminal_size()
     out = ["\033[2J\033[H"]
@@ -663,24 +668,32 @@ def draw(agents, note):
                f"{time.strftime('%H:%M:%S')}{RESET}\n\n")
     if not agents:
         out.append(f"  {DIM}no agents registered yet{RESET}\n")
-    id_w = max([len(r['id']) for r in agents] + [2])
-    where_w = max([len(r['where']) for r in agents] + [2])
+    id_w = min(max([len(r["id"]) for r in agents] + [2]), max(8, cols // 4))
+    where_w = max([len(r["where"]) for r in agents] + [0])
+    fixed = id_w + 19  # margin + index + dot + state + age + the gaps between
+    # narrow screen (phone popup): where is the first column to go, message the last
+    show_where = where_w and cols - fixed - (where_w + 1) >= 16
+    msg_w = cols - fixed - ((where_w + 1) if show_where else 0)
     for i, rec in enumerate(agents[:min(9, lines - 5)]):
         color = COLORS.get(rec["state"], "")
-        line = (f"  {DIM}{i + 1}{RESET} {color}●{RESET} "
-                f"{rec['id'].ljust(id_w)}  {color}{rec['state'].ljust(7)}{RESET}  "
-                f"{rec['age'].rjust(3)}  {DIM}{rec['where'].ljust(where_w)}{RESET}  "
-                f"{rec.get('message') or ''}")
-        out.append(line[:cols + len(line) - len_visible(line)] + RESET + "\n")
-    out.append(f"\n {DIM}q or esc quit · 1-9 jump to pane{RESET}")
+        parts = [
+            f"  {DIM}{i + 1}{RESET}",
+            f"{color}●{RESET}",
+            clip(rec["id"], id_w).ljust(id_w),
+            f"{color}{rec['state'].ljust(7)}{RESET}",
+            rec["age"].rjust(3),
+        ]
+        if show_where:
+            parts.append(f"{DIM}{clip(rec['where'], where_w).ljust(where_w)}{RESET}")
+        if msg_w >= 4:
+            parts.append(clip(rec.get("message") or "", msg_w))
+        out.append(" ".join(parts).rstrip() + "\n")
+    hint = "q or esc quit · 1-9 jump to pane" if cols >= 46 else "q/esc quit · 1-9 jump"
+    out.append(f"\n {DIM}{hint}{RESET}")
     if note:
         out.append(f"  {COLORS['blocked']}{note}{RESET}")
     sys.stdout.write("".join(out))
     sys.stdout.flush()
-
-
-def len_visible(text):
-    return len(re.sub(r"\033\[[0-9;]*m", "", text))
 
 
 def jump(rec, panes):
