@@ -118,10 +118,16 @@ window with one pane per role, then relay work between them:
 ```bash
 tmux new-window -t personal -n herdlet -c ~/code/herdlet
 tmux split-window -h -t personal:herdlet
-tmux send-keys -t personal:herdlet.0 "HERDLET_ID=personal/herdlet/dev claude" Enter
-tmux send-keys -t personal:herdlet.1 "HERDLET_ID=personal/herdlet/tester claude" Enter
+tmux send-keys -t personal:herdlet.0 "HERDLET_ID=personal/herdlet/dev CC_IMESSAGE_SKIP=1 claude" Enter
+tmux send-keys -t personal:herdlet.1 "HERDLET_ID=personal/herdlet/tester CC_IMESSAGE_SKIP=1 claude" Enter
 herdlet wait --id personal/herdlet/dev --state idle --timeout 30   # registered?
 ```
+
+spawn workers with the mute env vars of any per-turn notification hooks the
+user runs (like `CC_IMESSAGE_SKIP=1` above), so only masters page the human.
+the reverse also exists: `HERDLET_SKIP=1` makes herdlet ignore a nested
+agent run entirely; set it when a hook or script of yours shells out to
+`claude -p` from inside an agent's pane environment.
 
 then loop: `send` a role its task, chunked `wait --state done,blocked`,
 `peek` for the outcome, pass results to the next role, report to the user.

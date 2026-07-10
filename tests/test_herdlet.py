@@ -153,6 +153,13 @@ class HerdletTest(unittest.TestCase):
         proc = self.run_cli("get", "--id", "hk1")
         self.assertEqual(proc.returncode, 1)
 
+    def test_hook_skip_env(self):
+        self.parse(self.run_cli("report", "--id", "sk1", "--state", "done"))
+        self.run_cli("hook", stdin=json.dumps({"hook_event_name": "SessionEnd"}),
+                     env_extra={"HERDLET_ID": "sk1", "HERDLET_SKIP": "1"})
+        rec = self.parse(self.run_cli("get", "--id", "sk1"))["result"]
+        self.assertEqual(rec["state"], "done")
+
     def test_hook_never_fails(self):
         proc = self.run_cli("hook", stdin="not json at all")
         self.assertEqual(proc.returncode, 0)

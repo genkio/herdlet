@@ -24,7 +24,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 DEFAULT_SOCK = os.environ.get("HERDLET_SOCKET", os.path.expanduser("~/.herdlet.sock"))
 LOG_PATH = os.path.expanduser("~/.herdlet.log")
@@ -591,6 +591,10 @@ def cmd_setup(args):
 
 def cmd_hook(args):
     # fired from agent hook chains: never block, never fail, never print
+    if os.environ.get("HERDLET_SKIP"):
+        # nested/utility agent runs (e.g. a Stop hook summarizing via `claude -p`)
+        # inherit the real agent's TMUX_PANE/HERDLET_ID and would corrupt its record
+        return 0
     try:
         raw = "" if sys.stdin.isatty() else sys.stdin.read()
         data = json.loads(raw) if raw.strip() else {}
