@@ -25,7 +25,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 DEFAULT_SOCK = os.environ.get("HERDLET_SOCKET", os.path.expanduser("~/.herdlet.sock"))
 LOG_PATH = os.path.expanduser("~/.herdlet.log")
@@ -39,10 +39,35 @@ RESUME = {
 
 
 class Bus:
-    def __init__(self):
+    def __init__(self, state_path=None):
+        self.state_path = state_path
         self.agents = {}       # id -> record
         self.subscribers = set()  # (queue, id_filter, state_filter)
         self.waiters = []      # (predicate, future)
+        self._load()
+
+    def _load(self):
+        if not self.state_path:
+            return
+        try:
+            with open(self.state_path) as fh:
+                data = json.load(fh)
+            if isinstance(data, dict) and isinstance(data.get("agents"), dict):
+                self.agents = data["agents"]
+        except (OSError, json.JSONDecodeError):
+            pass  # best-effort: a bad snapshot just means an empty registry
+
+    def _save(self):
+        if not self.state_path:
+            return
+        try:
+            tmp = self.state_path + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump({"agents": self.agents}, fh)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.state_path)
+        except OSError:
+            pass  # persistence is best-effort; the live bus is the truth
 
     def snapshot(self, agent_id):
         rec = self.agents.get(agent_id)
@@ -62,6 +87,7 @@ class Bus:
             elif value is not None:
                 rec[key] = value
         rec["updated"] = round(time.time(), 3)
+        self._save()
         event = {"type": "agent.state_changed", **self.snapshot(agent_id)}
         self._fanout(event, agent_id, state)
         self._wake(agent_id, state, event)
@@ -71,6 +97,7 @@ class Bus:
         rec = self.agents.pop(agent_id, None)
         if rec is None:
             return None
+        self._save()
         event = {"type": "agent.removed", "id": agent_id}
         self._fanout(event, agent_id, None)
         return event
@@ -230,7 +257,7 @@ async def _handle_subscribe(reader, writer, bus, rid, params):
 
 
 async def _serve(sock_path):
-    bus = Bus()
+    bus = Bus(state_path=sock_path + ".state")
     server = await asyncio.start_unix_server(
         lambda r, w: _handle_client(r, w, bus), path=sock_path)
     os.chmod(sock_path, 0o600)
@@ -725,16 +752,20 @@ def cmd_peek(args):
 
 def cmd_ack(args):
     ids = [s.strip() for s in args.id.split(",") if s.strip()]
+    missing = 0
     for agent_id in ids:
         resp = call_or_die(args.socket, "agent.get", {"id": agent_id})
         rec = resp.get("result")
         if rec is None:
-            die(f"unknown agent '{agent_id}' (see: herdlet list)")
+            print(f"{agent_id}: unknown agent", file=sys.stderr)
+            missing += 1  # keep going: one retired worker must not block the rest
+            continue
         if rec["state"] == "done":
             call_or_die(args.socket, "agent.report", {"id": agent_id, "state": "idle"})
             print(f"{agent_id}: done -> idle")
         else:
             print(f"{agent_id}: {rec['state']} (nothing to ack)")
+    return 1 if missing else 0
 
 
 def cmd_resume(args):

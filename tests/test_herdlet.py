@@ -190,6 +190,50 @@ class HerdletTest(unittest.TestCase):
         rec = self.parse(self.run_cli("get", "--id", "ack2"))["result"]
         self.assertEqual(rec["state"], "working")
 
+    def test_ack_continues_past_unknown_ids(self):
+        self.parse(self.run_cli("report", "--id", "ack3", "--state", "done"))
+        proc = self.run_cli("ack", "--id", "ghost-one,ack3,ghost-two")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("unknown agent", proc.stderr)
+        rec = self.parse(self.run_cli("get", "--id", "ack3"))["result"]
+        self.assertEqual(rec["state"], "idle")
+
+    def test_registry_survives_daemon_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sock = os.path.join(tmp, "p.sock")
+
+            def start():
+                proc = subprocess.Popen(
+                    [sys.executable, BIN, "--socket", sock, "serve"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                for _ in range(50):
+                    if os.path.exists(sock):
+                        break
+                    time.sleep(0.05)
+                return proc
+
+            def cli(*args):
+                return subprocess.run(
+                    [sys.executable, BIN, "--socket", sock, *args],
+                    capture_output=True, text=True, timeout=15)
+
+            daemon = start()
+            try:
+                cli("report", "--id", "p1", "--state", "done",
+                    "--message", "built it", "--session", "s-123")
+            finally:
+                daemon.terminate()
+                daemon.wait(timeout=5)
+            daemon = start()
+            try:
+                rec = json.loads(cli("get", "--id", "p1").stdout)["result"]
+                self.assertEqual(rec["state"], "done")
+                self.assertEqual(rec["message"], "built it")
+                self.assertEqual(rec["session"], "s-123")
+            finally:
+                daemon.terminate()
+                daemon.wait(timeout=5)
+
     def test_resume_requires_session(self):
         self.parse(self.run_cli("report", "--id", "res1", "--state", "done"))
         proc = self.run_cli("resume", "--id", "res1")

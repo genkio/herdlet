@@ -139,15 +139,27 @@ read as text instead of submitting early.
 
 ## spawn a worker agent
 
+a bare `claude -p` pane CLOSES the moment the agent exits, destroying its
+scrollback - by the time you peek, the result is gone. for one-shot workers,
+tee the output to a file, keep the pane alive, and have the worker end with
+a sentinel line YOU chose (matching on guessed output vocabulary misses):
+
 ```bash
-tmux split-window -d -P -F '#{pane_id}' \
-  "HERDLET_ID=worker claude --model sonnet -p 'run the tests and summarize failures'"
-herdlet wait --id worker --state done,blocked --timeout 550
-herdlet peek --id worker --lines 40
+tmux split-window -d -P -F '#{pane_id}' "sh -c \"HERDLET_ID=worker \
+  claude --model sonnet -p 'run the tests and summarize failures; end your \
+  output with the line WORKER_DONE' | tee /tmp/worker.out; sleep 3600\""
+herdlet wait --id worker --state done,blocked --timeout 550   # or: --match WORKER_DONE
+cat /tmp/worker.out           # the result; then kill the pane
 ```
 
-interactive workers are the same without `-p`; after they register you drive
-them with `send` / `wait` / `peek` cycles.
+interactive workers don't have the exit race - the TUI keeps the pane open:
+
+```bash
+tmux split-window -d -P -F '#{pane_id}' \
+  "HERDLET_ID=worker claude --model sonnet"
+```
+
+after they register you drive them with `send` / `wait` / `peek` cycles.
 
 **pick a model and effort per role - never spawn bare `claude`.** a worker
 without `--model` inherits the human's default model, often their most
@@ -319,5 +331,7 @@ herdlet watch --state blocked # who just got stuck
   quiet pane means a human already acted; `peek` before trusting it. if the
   agent process itself died, `list` shows `stale` instead - that one needs
   `resume`, not a keypress.
-- if the daemon was restarted, agents re-register on their next hook event;
-  a missing entry does not necessarily mean the pane is dead. `peek` it.
+- the daemon persists the registry next to its socket and reloads it on
+  restart, so records survive; right after a restart they may be a beat
+  stale until the next hook event - the `gone`/`stale` annotations in
+  `list` still tell you what is real.
