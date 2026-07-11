@@ -80,6 +80,16 @@ herdlet wait --id proj/dev,proj/tester --state done,blocked --timeout 550
 herdlet wait --prefix proj/ --state blocked --timeout 550   # anyone stuck?
 ```
 
+`--edge` ignores whatever state is already recorded and wakes only on a
+fresh report. use it right after answering a menu: the registry still shows
+the pre-answer `blocked` until the worker's next hook event, so a plain
+`wait --state blocked` would match that stale state instantly instead of
+waiting for the real next transition:
+
+```bash
+herdlet wait --id proj/dev --state done,blocked --edge --timeout 550
+```
+
 to wait on terminal OUTPUT instead of agent state - a build finishing, a
 server logging "listening", a test summary - match a regex against the
 pane's recent lines. works on plain command panes too, which have no hook
@@ -164,6 +174,17 @@ note `--permission-mode acceptEdits` only auto-allows file edits; every shell
 command still prompts. answering menus by hand (see "unblock a worker") is
 the exception path, not the loop.
 
+**pre-registration blind spot.** keep the pane id `split-window -P` printed
+you; until the worker's first hook event it has no registry entry at all, so
+it is only addressable by that pane id. a first run in a new directory blocks
+on the folder-trust dialog BEFORE any hook exists - `peek` / `approve` that
+worker by pane id (`%N`), not by the name you gave it.
+
+**brief your workers on cwd.** commands run from the worker's own cwd; if you
+tell it to `cd X && ...` for another repo, that prefix defeats prefix-based
+permission allowlists and adds an extra approval warning per command. tell it
+to use `git -C <path>` (or the tool's own `--cwd`/`-C` flag) instead.
+
 ## act as a master orchestrator
 
 if the user asks you to manage a project (or several), you are the master:
@@ -221,21 +242,26 @@ ended its turn by asking you something. either way `peek` first, then:
 - **question in plain text**: answer it like a user would:
   `herdlet send --id herdlet/dev "yes, proceed with both releases"`
 - **permission menu** (numbered options): `approve` presses the option key
-  (menus react to a bare keypress; `send` would append Enter) and echoes the
-  pane so you see it took:
+  (menus react to a bare keypress; `send` would append Enter). `--wait` is
+  the primary form: one call answers, marks the worker `working`, waits for
+  its next real transition (edge-waited, so it can't match the stale
+  pre-answer state), and shows the pane - the whole babysit cycle in one
+  shot instead of three hand-rolled calls:
 
   ```bash
-  herdlet approve --id herdlet/dev              # option 1: approve once
-  herdlet approve --id herdlet/dev --option 3   # deny; then `send` a corrective instruction
-  tmux send-keys -t %5 Escape                   # dismiss a dialog
+  herdlet approve --id herdlet/dev --wait               # option 1: approve once, then wait+peek
+  herdlet approve --id herdlet/dev --option 3 --wait    # deny, then wait+peek; follow up with `send` if off-task
+  tmux send-keys -t %5 Escape                           # dismiss a dialog
   ```
 
 rules of thumb: approve only what matches the task you assigned; deny with a
 follow-up instruction if the action looks off-task; escalate to the human
 instead of guessing on anything destructive, irreversible, or outward-facing
 (pushes, PR creation, publishes, deletes) - milestones in a plan or handoff
-doc describe the goal, not permission to do these yourself. a denied permission fires no hook, so after
-answering a menu re-check with `get` rather than `wait`.
+doc describe the goal, not permission to do these yourself. **answer first,
+peek once - never peek inside a poll loop**; `approve --wait` already gives
+you that in one call. without `--wait`, a denied permission fires no hook,
+so after answering a menu re-check with `get` rather than `wait`.
 
 if you are approving the same class of command over and over, stop: that is a
 provisioning failure, not a babysitting duty. pick the menu's "always allow"

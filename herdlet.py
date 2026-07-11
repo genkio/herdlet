@@ -25,7 +25,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 DEFAULT_SOCK = os.environ.get("HERDLET_SOCKET", os.path.expanduser("~/.herdlet.sock"))
 LOG_PATH = os.path.expanduser("~/.herdlet.log")
@@ -180,11 +180,12 @@ async def _handle_wait(writer, bus, rid, params):
     def matches(agent_id):
         return agent_id in ids or (prefix is not None and agent_id.startswith(prefix))
 
-    for agent_id in list(bus.agents):
-        if matches(agent_id) and bus.agents[agent_id]["state"] in states:
-            _send(writer, {"id": rid, "result": {
-                "type": "waited", "already": True, **bus.snapshot(agent_id)}})
-            return
+    if not params.get("edge"):
+        for agent_id in list(bus.agents):
+            if matches(agent_id) and bus.agents[agent_id]["state"] in states:
+                _send(writer, {"id": rid, "result": {
+                    "type": "waited", "already": True, **bus.snapshot(agent_id)}})
+                return
 
     fut = asyncio.get_running_loop().create_future()
     entry = (lambda i, s: matches(i) and s in states, fut)
@@ -496,6 +497,8 @@ def cmd_wait(args):
     ids = [s.strip() for s in (args.id or "").split(",") if s.strip()]
     if not ids and not args.prefix:
         die("pass --id (comma-separated waits on whichever transitions first) and/or --prefix")
+    if args.edge and args.match:
+        die("--edge is meaningless with --match: a match poll never checks stored state")
     if args.match:
         return wait_for_match(args, ids)
     if not args.state:
@@ -509,6 +512,8 @@ def cmd_wait(args):
             params["ids"] = ids
         if args.prefix:
             params["prefix"] = args.prefix
+    if args.edge:
+        params["edge"] = True  # only send when set, so older daemons still work
     if args.timeout:
         params["timeout_ms"] = int(args.timeout * 1000)
     client_timeout = args.timeout + 5 if args.timeout else None
@@ -765,8 +770,49 @@ def cmd_approve(args):
     pane = resolve_pane(args.socket, args.id)
     tmux("send-keys", "-t", pane, args.option, check=True)  # bare keypress: menus react without Enter
     time.sleep(args.settle)
+
+    if not args.wait:
+        out = tmux("capture-pane", "-p", "-t", pane, "-S", f"-{args.lines}", check=True)
+        print(out.rstrip("\n"))
+        return 0
+
+    try:
+        record = call(args.socket, "agent.get", {"id": args.id}).get("result")
+        # only report working if the record still shows the stale pre-answer
+        # 'blocked'; a state that already moved on (settle-window race) must
+        # be seen by a plain (non-edge) wait below, not skipped past
+        edge = record is not None and record.get("state") == "blocked"
+        if edge:
+            # answering a menu resumes the turn either way (approve or deny);
+            # the next real hook event corrects this if the optimism is wrong
+            call(args.socket, "agent.report", {"id": args.id, "state": "working"}, timeout=1.0)
+    except OSError:
+        # approve's core job (the keypress) already happened; don't fail after the side effect
+        out = tmux("capture-pane", "-p", "-t", pane, "-S", f"-{args.lines}", check=True)
+        print(out.rstrip("\n"))
+        return 0
+
+    states = [s.strip() for s in args.state.split(",") if s.strip()]
+    params = {"id": args.id, "states": states}
+    if edge:
+        params["edge"] = True
+    if args.timeout:
+        params["timeout_ms"] = int(args.timeout * 1000)
+    client_timeout = args.timeout + 5 if args.timeout else None
+    try:
+        resp = call(args.socket, "wait", params, timeout=client_timeout)
+        state = resp["result"]["state"] if "result" in resp else "timeout"
+    except TimeoutError:  # hung daemon: treat like a normal wait timeout, not unreachable
+        state = "timeout"
+    except OSError:
+        out = tmux("capture-pane", "-p", "-t", pane, "-S", f"-{args.lines}", check=True)
+        print(out.rstrip("\n"))
+        return 0
+
     out = tmux("capture-pane", "-p", "-t", pane, "-S", f"-{args.lines}", check=True)
+    print(f"state: {state}")
     print(out.rstrip("\n"))
+    return 0 if state != "timeout" else 2
 
 
 COLORS = {"working": "\033[33m", "blocked": "\033[1;31m", "done": "\033[32m",
@@ -964,6 +1010,9 @@ def main():
     p.add_argument("--match", help="instead: regex to match against the pane's recent output")
     p.add_argument("--lines", type=int, default=200, help="output lines scanned per --match poll")
     p.add_argument("--timeout", type=float, help="seconds (exit 2 on timeout)")
+    p.add_argument("--edge", action="store_true",
+                   help="ignore the current state; wake only on a fresh report "
+                        "(use right after answering a menu, to avoid matching the stale state)")
     p.set_defaults(fn=cmd_wait)
 
     p = sub.add_parser("watch", help="stream state-change events as JSON lines")
@@ -1007,6 +1056,13 @@ def main():
     p.add_argument("--lines", type=int, default=20, help="pane lines to echo back after answering")
     p.add_argument("--settle", type=float, default=1.0,
                    help="seconds to let the TUI redraw before reading (default: 1.0)")
+    p.add_argument("--wait", action="store_true",
+                   help="after answering, mark the agent working and wait for its next "
+                        "real transition (see --state/--timeout below), then show the pane")
+    p.add_argument("--state", default="done,blocked",
+                   help="target state(s) for --wait, comma-separated (default: done,blocked)")
+    p.add_argument("--timeout", type=float, default=550,
+                   help="seconds for --wait (default: 550)")
     p.set_defaults(fn=cmd_approve)
 
     p = sub.add_parser("monitor", help="live status view (made for a tmux popup)")

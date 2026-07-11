@@ -156,6 +156,11 @@ class HerdletTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("single digit", proc.stderr)
 
+    def test_approve_wait_unknown_id(self):
+        proc = self.run_cli("approve", "--id", "nope", "--wait")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("unknown agent", proc.stderr)
+
     def test_hook_captures_session_id(self):
         env = {"HERDLET_ID": "sess1"}
         self.run_cli("hook", stdin=json.dumps(
@@ -219,6 +224,25 @@ class HerdletTest(unittest.TestCase):
         proc = self.run_cli("wait", "--id", "a", "--timeout", "1")
         self.assertEqual(proc.returncode, 1)
         self.assertIn("--state", proc.stderr)
+
+    def test_wait_edge_ignores_already_satisfied(self):
+        self.parse(self.run_cli("report", "--id", "e1", "--state", "done"))
+        proc = self.run_cli("wait", "--id", "e1", "--state", "done", "--edge", "--timeout", "0.3")
+        self.assertEqual(proc.returncode, 2)
+
+    def test_wait_edge_wakes_on_fresh_transition(self):
+        self.parse(self.run_cli("report", "--id", "e2", "--state", "done"))
+        timer = threading.Timer(0.3, lambda: self.run_cli(
+            "report", "--id", "e2", "--state", "done"))
+        timer.start()
+        resp = self.parse(self.run_cli(
+            "wait", "--id", "e2", "--state", "done", "--edge", "--timeout", "5"))
+        timer.join()
+        self.assertFalse(resp["result"]["already"])
+
+    def test_wait_edge_match_dies(self):
+        proc = self.run_cli("wait", "--id", "a", "--match", "x", "--edge", "--timeout", "1")
+        self.assertEqual(proc.returncode, 1)
 
     def test_subscribe_pushes_events(self):
         conn = socket.socket(socket.AF_UNIX)

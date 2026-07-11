@@ -53,6 +53,7 @@ herdlet list
 herdlet wait --id builder --state done,blocked --timeout 600   # push-woken, no polling
 herdlet wait --id builder,tester --state done,blocked --timeout 600  # any-of: wakes on whichever first
 herdlet wait --prefix myproject/ --state blocked --timeout 600       # anyone in the project stuck?
+herdlet wait --id builder --state blocked --edge --timeout 600  # ignore stale state, wake on a fresh report only
 herdlet watch                                    # stream every state change as JSON lines
 herdlet list --here                              # scope to the current tmux session
 herdlet list --prefix myproject/                 # scope to one project's agents
@@ -62,6 +63,7 @@ herdlet wait --id builder --match 'tests? passed|ERROR' --timeout 600  # wait on
 herdlet send --id builder "run the tests again"  # types into builder's pane + Enter (multi-line = one bracketed paste)
 herdlet peek --id builder --lines 40             # read builder's recent output (--join unwraps soft wraps)
 herdlet approve --id builder                     # answer a permission menu (option 1), echo the pane
+herdlet approve --id builder --wait              # answer, mark working, edge-wait for the next transition, show the pane
 herdlet ack --id builder                         # collected the result: done -> idle (list = inbox)
 herdlet resume --id builder                      # agent died? type its native resume command into the pane
 herdlet monitor                                  # live TUI (made for a tmux popup)
