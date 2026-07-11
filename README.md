@@ -38,6 +38,9 @@ wiring? The snippets are below.
 
 There is no daemon to babysit: `hook`, `report` and `monitor` auto-start it
 on first use (`herdlet serve` runs it in the foreground if you prefer).
+After upgrading, restart it so new protocol features (any-of `wait`) are
+served: `pkill -f 'herdlet.*serve'`; agents re-register on their next hook
+event.
 
 ## Quickstart
 
@@ -48,12 +51,19 @@ herdlet list
 # builder  working  2s   -      %5    dots:1 zsh  npm test
 
 herdlet wait --id builder --state done,blocked --timeout 600   # push-woken, no polling
+herdlet wait --id builder,tester --state done,blocked --timeout 600  # any-of: wakes on whichever first
+herdlet wait --prefix myproject/ --state blocked --timeout 600       # anyone in the project stuck?
 herdlet watch                                    # stream every state change as JSON lines
 herdlet list --here                              # scope to the current tmux session
 herdlet list --prefix myproject/                 # scope to one project's agents
 
-herdlet send --id builder "run the tests again"  # types into builder's pane + Enter
-herdlet peek --id builder --lines 40             # read builder's recent output
+herdlet wait --id builder --match 'tests? passed|ERROR' --timeout 600  # wait on pane OUTPUT (plain commands too)
+
+herdlet send --id builder "run the tests again"  # types into builder's pane + Enter (multi-line = one bracketed paste)
+herdlet peek --id builder --lines 40             # read builder's recent output (--join unwraps soft wraps)
+herdlet approve --id builder                     # answer a permission menu (option 1), echo the pane
+herdlet ack --id builder                         # collected the result: done -> idle (list = inbox)
+herdlet resume --id builder                      # agent died? type its native resume command into the pane
 herdlet monitor                                  # live TUI (made for a tmux popup)
 ```
 
@@ -75,7 +85,14 @@ never blocks, and always exits 0, so it is safe in any hook chain.
 | SessionEnd | removed from registry |
 
 The prompt text becomes the agent's `message`, so `list` / `monitor` show
-what each agent is working on.
+what each agent is working on. Hooks also record the agent's native session
+id, which is what powers `herdlet resume` (types `claude --resume <id>` /
+`codex resume <id>` into the pane after a crash or usage-limit kill).
+
+`list` and `monitor` cross-check the registry against reality: an agent
+whose pane is gone shows `gone`; one whose pane fell back to a bare shell
+while hooks last said working/blocked shows `stale` (the process died
+without a hook firing - resume it).
 
 `herdlet setup` wires all of this for you; the snippets below are the manual
 reference. Claude Code `settings.json` (same pattern for Codex `hooks.json`,
@@ -135,8 +152,8 @@ a tester, requirement is ...", and it runs
 ```bash
 tmux new-window -t personal -n herdlet -c ~/code/herdlet
 tmux split-window -h -t personal:herdlet
-tmux send-keys -t personal:herdlet.0 "HERDLET_ID=personal/herdlet/dev claude" Enter
-tmux send-keys -t personal:herdlet.1 "HERDLET_ID=personal/herdlet/tester claude" Enter
+tmux send-keys -t personal:herdlet.0 "HERDLET_ID=personal/herdlet/dev claude --model sonnet" Enter
+tmux send-keys -t personal:herdlet.1 "HERDLET_ID=personal/herdlet/tester claude --model haiku" Enter
 ```
 
 then drives the pair with `send` / `wait --state done,blocked` / `peek`,
@@ -161,13 +178,20 @@ npx skills add genkio/herdlet        # Claude Code, Codex, Cursor, ...
 
 ```bash
 # spawn a worker in a new pane, wait for it, read its result
-tmux split-window -d -P -F '#{pane_id}' "HERDLET_ID=worker claude -p 'run the test suite'"
+tmux split-window -d -P -F '#{pane_id}' "HERDLET_ID=worker claude --model sonnet -p 'run the test suite'"
 herdlet wait --id worker --state done,blocked --timeout 900
 herdlet peek --id worker --lines 40
 herdlet send --id worker "now fix the failing test"
 ```
 
 The waiter is woken by a push from the daemon, not a polling loop.
+
+The skill bakes in the economics lessons of running herds for real: pick a
+model per role (a bare `claude` inherits the human's default, often their
+most expensive tier), provision worker permissions at spawn time instead of
+babysitting menus, wait on the whole herd in one long call, and prefer
+short-lived phase-scoped workers over one pane dragging a huge context
+through an entire project.
 
 ## Protocol
 
@@ -176,12 +200,14 @@ Newline-delimited JSON over `~/.herdlet.sock` (override with `--socket` or
 `{"id", "result"}` or `{"id", "error"}`.
 
 Methods: `ping`, `agent.report`, `agent.get`, `agent.list`, `agent.remove`,
-`wait` (`{id, states, timeout_ms}`), `subscribe` (`{id?, state?}`, connection
-then streams `agent.state_changed` / `agent.removed` events).
+`wait` (`{id | ids | prefix, states, timeout_ms}`, wakes on the first
+matching agent), `subscribe` (`{id?, state?}`, connection then streams
+`agent.state_changed` / `agent.removed` events).
 
 Report merge semantics: absent/null fields preserve the previous value, empty
-string clears. Tool-use hooks report `message: null`, which is why the prompt
-survives as the message for the whole turn.
+string clears (merge keys: `message`, `agent`, `pane`, `cwd`, `session`).
+Tool-use hooks report `message: null`, which is why the prompt survives as
+the message for the whole turn.
 
 ## Development
 

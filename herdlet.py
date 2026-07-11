@@ -16,6 +16,8 @@ import argparse
 import asyncio
 import json
 import os
+import re
+import shlex
 import shutil
 import signal
 import socket
@@ -23,12 +25,17 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.2.3"
+__version__ = "0.4.0"
 
 DEFAULT_SOCK = os.environ.get("HERDLET_SOCKET", os.path.expanduser("~/.herdlet.sock"))
 LOG_PATH = os.path.expanduser("~/.herdlet.log")
 STATES = ("idle", "working", "blocked", "done", "unknown")
-MERGE_KEYS = ("message", "agent", "pane", "cwd")
+MERGE_KEYS = ("message", "agent", "pane", "cwd", "session")
+SHELLS = {"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "nu"}
+RESUME = {
+    "claude": "claude --resume {session}",
+    "codex": "codex resume {session}",
+}
 
 
 class Bus:
@@ -44,7 +51,7 @@ class Bus:
     def report(self, agent_id, params):
         rec = self.agents.setdefault(agent_id, {
             "state": "unknown", "message": None, "agent": None,
-            "pane": None, "cwd": None, "updated": 0.0,
+            "pane": None, "cwd": None, "session": None, "updated": 0.0,
         })
         state = params.get("state") or rec["state"]
         rec["state"] = state
@@ -163,26 +170,32 @@ async def _handle_client(reader, writer, bus):
 
 
 async def _handle_wait(writer, bus, rid, params):
-    agent_id = params.get("id")
+    ids = params.get("ids") or ([params["id"]] if params.get("id") else [])
+    prefix = params.get("prefix")
     states = params.get("states") or ([params["state"]] if params.get("state") else None)
-    if not agent_id or not states:
+    if (not ids and not prefix) or not states:
         _send(writer, {"id": rid, "error": {"code": "invalid_params"}})
         return
 
-    snap = bus.snapshot(agent_id)
-    if snap and snap["state"] in states:
-        _send(writer, {"id": rid, "result": {"type": "waited", "already": True, **snap}})
-        return
+    def matches(agent_id):
+        return agent_id in ids or (prefix is not None and agent_id.startswith(prefix))
+
+    for agent_id in list(bus.agents):
+        if matches(agent_id) and bus.agents[agent_id]["state"] in states:
+            _send(writer, {"id": rid, "result": {
+                "type": "waited", "already": True, **bus.snapshot(agent_id)}})
+            return
 
     fut = asyncio.get_running_loop().create_future()
-    entry = (lambda i, s: i == agent_id and s in states, fut)
+    entry = (lambda i, s: matches(i) and s in states, fut)
     bus.waiters.append(entry)
     timeout = params.get("timeout_ms")
     try:
         event = await asyncio.wait_for(fut, timeout / 1000.0 if timeout else None)
         _send(writer, {"id": rid, "result": {**event, "type": "waited", "already": False}})
     except asyncio.TimeoutError:
-        _send(writer, {"id": rid, "error": {"code": "timeout", "agent": agent_id, "states": states}})
+        _send(writer, {"id": rid, "error": {"code": "timeout", "agents": ids,
+                                            "prefix": prefix, "states": states}})
     finally:
         if entry in bus.waiters:
             bus.waiters.remove(entry)
@@ -314,9 +327,10 @@ def squash(text, limit=120):
     return " ".join(str(text).split())[:limit]
 
 
-def tmux(*args, check=False):
+def tmux(*args, check=False, input=None):
     try:
-        out = subprocess.run(("tmux",) + args, capture_output=True, text=True, timeout=5)
+        out = subprocess.run(("tmux",) + args, capture_output=True, text=True,
+                             timeout=5, input=input)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         if check:
             die("tmux not available")
@@ -330,12 +344,15 @@ def tmux(*args, check=False):
 
 def pane_map():
     out = tmux("list-panes", "-a", "-F",
-               "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{window_name}")
+               "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}"
+               "\t#{window_name}\t#{pane_current_command}")
     panes = {}
     for line in (out or "").splitlines():
-        pane, session, window_id, window_index, window_name = (line.split("\t") + [""] * 5)[:5]
+        pane, session, window_id, window_index, window_name, command = \
+            (line.split("\t") + [""] * 6)[:6]
         panes[pane] = {"session": session, "window_id": window_id,
-                       "window_index": window_index, "window_name": window_name}
+                       "window_index": window_index, "window_name": window_name,
+                       "command": command}
     return panes
 
 
@@ -368,6 +385,8 @@ def cmd_report(args):
         params["agent"] = args.agent
     if args.cwd:
         params["cwd"] = args.cwd
+    if args.session:
+        params["session"] = args.session
     ensure_daemon(args.socket)
     emit(call_or_die(args.socket, "agent.report", params))
 
@@ -384,8 +403,8 @@ def cmd_remove(args):
 
 
 def sort_key(rec):
-    order = {"blocked": 0, "working": 1, "done": 2, "idle": 3}
-    return (order.get(rec["state"], 4), -rec["updated"])
+    order = {"blocked": 0, "stale": 1, "working": 2, "done": 3, "idle": 4}
+    return (order.get(rec["state"], 5), -rec["updated"])
 
 
 def age(seconds):
@@ -405,6 +424,10 @@ def annotate(agents, panes):
         if pane and panes and pane not in panes:
             rec["state"] = "gone"
         info = panes.get(pane) if pane else None
+        # agent process exited without a hook firing (deny, crash, ctrl-c):
+        # the pane is back at a bare shell while the record says otherwise
+        if info and rec["state"] in ("working", "blocked") and info.get("command") in SHELLS:
+            rec["state"] = "stale"
         rec["where"] = f"{info['session']}:{info['window_index']} {info['window_name']}" if info else ""
         rec["age"] = age(now - rec["updated"])
     agents.sort(key=sort_key)
@@ -444,10 +467,48 @@ def cmd_list(args):
         print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row[:6])) + "  " + row[6])
 
 
+def wait_for_match(args, ids):
+    if args.prefix or len(ids) != 1:
+        die("--match takes exactly one --id and no --prefix")
+    if args.state:
+        die("--match and --state are mutually exclusive")
+    try:
+        rx = re.compile(args.match)
+    except re.error as exc:
+        die(f"invalid regex: {exc}")
+    pane = resolve_pane(args.socket, ids[0])
+    deadline = time.time() + args.timeout if args.timeout else None
+    while True:
+        out = tmux("capture-pane", "-p", "-J", "-t", pane, "-S", f"-{args.lines}", check=True) or ""
+        for line in out.splitlines():
+            if rx.search(line):
+                print(json.dumps({"result": {"type": "output_matched",
+                                             "id": ids[0], "line": line}}, indent=2))
+                return 0
+        if deadline is not None and time.time() >= deadline:
+            print(json.dumps({"error": {"code": "timeout", "id": ids[0],
+                                        "match": args.match}}, indent=2))
+            return 2
+        time.sleep(2)
+
+
 def cmd_wait(args):
-    agent_id = args.id or default_id()
+    ids = [s.strip() for s in (args.id or "").split(",") if s.strip()]
+    if not ids and not args.prefix:
+        die("pass --id (comma-separated waits on whichever transitions first) and/or --prefix")
+    if args.match:
+        return wait_for_match(args, ids)
+    if not args.state:
+        die("pass --state (or --match to wait on pane output)")
     states = [s.strip() for s in args.state.split(",") if s.strip()]
-    params = {"id": agent_id, "states": states}
+    params = {"states": states}
+    if len(ids) == 1 and not args.prefix:
+        params["id"] = ids[0]  # single-id shape, keeps pre-0.3 daemons working
+    else:
+        if ids:
+            params["ids"] = ids
+        if args.prefix:
+            params["prefix"] = args.prefix
     if args.timeout:
         params["timeout_ms"] = int(args.timeout * 1000)
     client_timeout = args.timeout + 5 if args.timeout else None
@@ -616,6 +677,9 @@ def cmd_hook(args):
                   "agent": args.agent,
                   "pane": os.environ.get("TMUX_PANE"),
                   "cwd": data.get("cwd") or os.getcwd()}
+        # the agent's native session ref enables `herdlet resume` later
+        if data.get("session_id"):
+            params["session"] = squash(str(data["session_id"]), 200)
         # message: prompt/notification text is worth showing; tool events pass
         # None so the daemon preserves the prompt across the whole turn
         if event == "UserPromptSubmit":
@@ -636,7 +700,12 @@ def cmd_hook(args):
 def cmd_send(args):
     pane = resolve_pane(args.socket, args.id)
     text = " ".join(args.text)
-    tmux("send-keys", "-t", pane, "-l", "--", text, check=True)
+    if "\n" in text:
+        # bracketed paste: a readline TUI takes the newlines as text, not submits
+        tmux("load-buffer", "-b", "herdlet-send", "-", input=text, check=True)
+        tmux("paste-buffer", "-p", "-d", "-b", "herdlet-send", "-t", pane, check=True)
+    else:
+        tmux("send-keys", "-t", pane, "-l", "--", text, check=True)
     if not args.no_enter:
         time.sleep(0.2)  # let the TUI ingest the text before submit
         tmux("send-keys", "-t", pane, "Enter", check=True)
@@ -644,12 +713,65 @@ def cmd_send(args):
 
 def cmd_peek(args):
     pane = resolve_pane(args.socket, args.id)
+    flags = ["-p", "-J"] if args.join else ["-p"]
+    out = tmux("capture-pane", *flags, "-t", pane, "-S", f"-{args.lines}", check=True)
+    print(out.rstrip("\n"))
+
+
+def cmd_ack(args):
+    ids = [s.strip() for s in args.id.split(",") if s.strip()]
+    for agent_id in ids:
+        resp = call_or_die(args.socket, "agent.get", {"id": agent_id})
+        rec = resp.get("result")
+        if rec is None:
+            die(f"unknown agent '{agent_id}' (see: herdlet list)")
+        if rec["state"] == "done":
+            call_or_die(args.socket, "agent.report", {"id": agent_id, "state": "idle"})
+            print(f"{agent_id}: done -> idle")
+        else:
+            print(f"{agent_id}: {rec['state']} (nothing to ack)")
+
+
+def cmd_resume(args):
+    resp = call_or_die(args.socket, "agent.get", {"id": args.id})
+    rec = resp.get("result")
+    if rec is None:
+        die(f"unknown agent '{args.id}' (see: herdlet list)")
+    session = rec.get("session")
+    if not session:
+        die(f"no session recorded for '{args.id}'; its hooks never reported one")
+    if not re.fullmatch(r"[A-Za-z0-9_./:-]{1,200}", session):
+        die("recorded session ref looks unsafe; refusing to type it")
+    agent = args.agent or rec.get("agent") or "claude"
+    template = RESUME.get(agent)
+    if not template:
+        die(f"no resume syntax known for agent '{agent}' (known: {', '.join(sorted(RESUME))})")
+    pane = args.pane or rec.get("pane")
+    if not pane:
+        die(f"'{args.id}' has no pane; spawn one and pass --pane %N")
+    current = (tmux("display-message", "-p", "-t", pane, "#{pane_current_command}") or "").strip()
+    if not args.force and current and current not in SHELLS:
+        die(f"pane {pane} is running '{current}', not a bare shell; pass --force to type anyway")
+    cmd = template.format(session=shlex.quote(session))
+    tmux("send-keys", "-t", pane, "-l", "--", cmd, check=True)
+    time.sleep(0.2)
+    tmux("send-keys", "-t", pane, "Enter", check=True)
+    print(f"resume sent to {pane}: {cmd}")
+
+
+def cmd_approve(args):
+    if not (len(args.option) == 1 and args.option.isdigit()):
+        die("--option must be a single digit menu key")
+    pane = resolve_pane(args.socket, args.id)
+    tmux("send-keys", "-t", pane, args.option, check=True)  # bare keypress: menus react without Enter
+    time.sleep(args.settle)
     out = tmux("capture-pane", "-p", "-t", pane, "-S", f"-{args.lines}", check=True)
     print(out.rstrip("\n"))
 
 
 COLORS = {"working": "\033[33m", "blocked": "\033[1;31m", "done": "\033[32m",
-          "idle": "\033[2m", "unknown": "\033[2m", "gone": "\033[35m"}
+          "idle": "\033[2m", "unknown": "\033[2m", "gone": "\033[35m",
+          "stale": "\033[31m"}
 RESET = "\033[0m"
 DIM = "\033[2m"
 BOLD = "\033[1m"
@@ -817,6 +939,7 @@ def main():
     p.add_argument("--agent", help="agent kind, e.g. claude / codex")
     p.add_argument("--pane", help="tmux pane id (default: $TMUX_PANE)")
     p.add_argument("--cwd", help="working directory")
+    p.add_argument("--session", help="agent's native session ref (enables resume)")
     p.set_defaults(fn=cmd_report)
 
     p = sub.add_parser("get", help="get one agent's record")
@@ -834,9 +957,12 @@ def main():
     p.add_argument("--id", help="agent id (default: $HERDLET_ID or $TMUX_PANE)")
     p.set_defaults(fn=cmd_remove)
 
-    p = sub.add_parser("wait", help="block until an agent reaches a state")
-    p.add_argument("--id", required=True)
-    p.add_argument("--state", required=True, help="target state(s), comma-separated")
+    p = sub.add_parser("wait", help="block until an agent reaches a state, or its pane output matches")
+    p.add_argument("--id", help="agent id(s), comma-separated: wakes on whichever transitions first")
+    p.add_argument("--prefix", help="also wake on any agent whose id starts with this prefix")
+    p.add_argument("--state", help="target state(s), comma-separated")
+    p.add_argument("--match", help="instead: regex to match against the pane's recent output")
+    p.add_argument("--lines", type=int, default=200, help="output lines scanned per --match poll")
     p.add_argument("--timeout", type=float, help="seconds (exit 2 on timeout)")
     p.set_defaults(fn=cmd_wait)
 
@@ -860,7 +986,28 @@ def main():
     p = sub.add_parser("peek", help="read an agent's recent pane output")
     p.add_argument("--id", required=True, help="agent id or tmux pane id")
     p.add_argument("--lines", type=int, default=60)
+    p.add_argument("--join", action="store_true", help="unwrap soft-wrapped lines (better for logs)")
     p.set_defaults(fn=cmd_peek)
+
+    p = sub.add_parser("ack", help="mark collected results as seen: done -> idle")
+    p.add_argument("--id", required=True, help="agent id(s), comma-separated")
+    p.set_defaults(fn=cmd_ack)
+
+    p = sub.add_parser("resume", help="type an agent's native resume command into its pane")
+    p.add_argument("--id", required=True, help="agent id (session ref comes from its hook reports)")
+    p.add_argument("--pane", help="target pane override, e.g. %%7 (default: the recorded pane)")
+    p.add_argument("--agent", help="agent kind override (default: recorded kind, else claude)")
+    p.add_argument("--force", action="store_true",
+                   help="type even if the pane is not sitting at a bare shell")
+    p.set_defaults(fn=cmd_resume)
+
+    p = sub.add_parser("approve", help="answer an agent's numbered permission menu, then show its pane")
+    p.add_argument("--id", required=True, help="agent id or tmux pane id")
+    p.add_argument("--option", default="1", help="menu option key to press (default: 1)")
+    p.add_argument("--lines", type=int, default=20, help="pane lines to echo back after answering")
+    p.add_argument("--settle", type=float, default=1.0,
+                   help="seconds to let the TUI redraw before reading (default: 1.0)")
+    p.set_defaults(fn=cmd_approve)
 
     p = sub.add_parser("monitor", help="live status view (made for a tmux popup)")
     p.add_argument("--session", help="only agents in this tmux session")

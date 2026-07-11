@@ -110,6 +110,116 @@ class HerdletTest(unittest.TestCase):
         proc = self.run_cli("wait", "--id", "ghost", "--state", "done", "--timeout", "0.3")
         self.assertEqual(proc.returncode, 2)
 
+    def test_wait_any_of_multiple_ids(self):
+        self.parse(self.run_cli("report", "--id", "any1", "--state", "working"))
+        self.parse(self.run_cli("report", "--id", "any2", "--state", "working"))
+        timer = threading.Timer(0.3, lambda: self.run_cli(
+            "report", "--id", "any2", "--state", "done"))
+        timer.start()
+        resp = self.parse(self.run_cli(
+            "wait", "--id", "any1,any2", "--state", "done", "--timeout", "5"))
+        timer.join()
+        self.assertEqual(resp["result"]["id"], "any2")
+
+    def test_wait_prefix_wakes_on_new_agent(self):
+        self.parse(self.run_cli("report", "--id", "wp/one", "--state", "working"))
+        timer = threading.Timer(0.3, lambda: self.run_cli(
+            "report", "--id", "wp/two", "--state", "blocked"))
+        timer.start()
+        resp = self.parse(self.run_cli(
+            "wait", "--prefix", "wp/", "--state", "blocked", "--timeout", "5"))
+        timer.join()
+        self.assertEqual(resp["result"]["id"], "wp/two")
+
+    def test_wait_prefix_already_satisfied(self):
+        self.parse(self.run_cli("report", "--id", "wq/one", "--state", "done"))
+        resp = self.parse(self.run_cli(
+            "wait", "--prefix", "wq/", "--state", "done", "--timeout", "2"))
+        self.assertTrue(resp["result"]["already"])
+        self.assertEqual(resp["result"]["id"], "wq/one")
+
+    def test_wait_multi_id_timeout_exit_2(self):
+        proc = self.run_cli("wait", "--id", "ghost1,ghost2", "--state", "done", "--timeout", "0.3")
+        self.assertEqual(proc.returncode, 2)
+
+    def test_wait_requires_id_or_prefix(self):
+        proc = self.run_cli("wait", "--state", "done", "--timeout", "1")
+        self.assertEqual(proc.returncode, 1)
+
+    def test_approve_unknown_id(self):
+        proc = self.run_cli("approve", "--id", "nope")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("unknown agent", proc.stderr)
+
+    def test_approve_rejects_non_digit_option(self):
+        proc = self.run_cli("approve", "--id", "x", "--option", "yes")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("single digit", proc.stderr)
+
+    def test_hook_captures_session_id(self):
+        env = {"HERDLET_ID": "sess1"}
+        self.run_cli("hook", stdin=json.dumps(
+            {"hook_event_name": "UserPromptSubmit", "prompt": "go",
+             "session_id": "abc-123", "cwd": "/tmp"}), env_extra=env)
+        rec = self.parse(self.run_cli("get", "--id", "sess1"))["result"]
+        self.assertEqual(rec["session"], "abc-123")
+        # events without a session_id preserve the recorded one
+        self.run_cli("hook", stdin=json.dumps({"hook_event_name": "Stop"}), env_extra=env)
+        rec = self.parse(self.run_cli("get", "--id", "sess1"))["result"]
+        self.assertEqual(rec["session"], "abc-123")
+
+    def test_ack_done_to_idle(self):
+        self.parse(self.run_cli("report", "--id", "ack1", "--state", "done",
+                                "--message", "built it"))
+        proc = self.run_cli("ack", "--id", "ack1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rec = self.parse(self.run_cli("get", "--id", "ack1"))["result"]
+        self.assertEqual(rec["state"], "idle")
+        self.assertEqual(rec["message"], "built it")
+
+    def test_ack_ignores_non_done(self):
+        self.parse(self.run_cli("report", "--id", "ack2", "--state", "working"))
+        proc = self.run_cli("ack", "--id", "ack2")
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("nothing to ack", proc.stdout)
+        rec = self.parse(self.run_cli("get", "--id", "ack2"))["result"]
+        self.assertEqual(rec["state"], "working")
+
+    def test_resume_requires_session(self):
+        self.parse(self.run_cli("report", "--id", "res1", "--state", "done"))
+        proc = self.run_cli("resume", "--id", "res1")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("session", proc.stderr)
+
+    def test_resume_requires_pane(self):
+        self.parse(self.run_cli("report", "--id", "res2", "--state", "done",
+                                "--session", "abc-123"))
+        proc = self.run_cli("resume", "--id", "res2")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("pane", proc.stderr)
+
+    def test_resume_unknown_agent_kind(self):
+        self.parse(self.run_cli("report", "--id", "res3", "--state", "done",
+                                "--session", "abc", "--agent", "mystery"))
+        proc = self.run_cli("resume", "--id", "res3")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("resume syntax", proc.stderr)
+
+    def test_wait_match_validation(self):
+        proc = self.run_cli("wait", "--id", "a,b", "--match", "x", "--timeout", "1")
+        self.assertEqual(proc.returncode, 1)
+        proc = self.run_cli("wait", "--id", "a", "--state", "done", "--match", "x")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("mutually exclusive", proc.stderr)
+        proc = self.run_cli("wait", "--id", "a", "--match", "(", "--timeout", "1")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("invalid regex", proc.stderr)
+
+    def test_wait_needs_state_or_match(self):
+        proc = self.run_cli("wait", "--id", "a", "--timeout", "1")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("--state", proc.stderr)
+
     def test_subscribe_pushes_events(self):
         conn = socket.socket(socket.AF_UNIX)
         conn.settimeout(5)

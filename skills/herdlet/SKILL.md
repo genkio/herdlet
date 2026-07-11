@@ -51,7 +51,10 @@ herdlet list --json             # machine-readable
 herdlet get --id herdlet/tester
 ```
 
-a state of `gone` means the agent's pane no longer exists.
+a state of `gone` means the agent's pane no longer exists. a state of
+`stale` means the pane is back at a bare shell while the last hook said
+working/blocked - the agent process died (crash, usage limit, ctrl-c)
+without a hook firing. see "resume a dead worker".
 
 ## wait for another agent
 
@@ -69,8 +72,31 @@ herdlet wait --id builder --state done,blocked --timeout 600
 exit code 0 = state reached (`result.state` says which), 2 = timeout. always
 pass `--timeout`. after waking, `peek` to see what actually happened.
 
-if your shell tool has its own timeout (Claude Code's Bash defaults to 2
-minutes), wait in chunks instead of one long block:
+to watch several agents at once, wait on all of them in one call; it wakes on
+whichever transitions first (`result.id` says which):
+
+```bash
+herdlet wait --id proj/dev,proj/tester --state done,blocked --timeout 550
+herdlet wait --prefix proj/ --state blocked --timeout 550   # anyone stuck?
+```
+
+to wait on terminal OUTPUT instead of agent state - a build finishing, a
+server logging "listening", a test summary - match a regex against the
+pane's recent lines. works on plain command panes too, which have no hook
+state at all; never hand-roll sleep/curl polling loops:
+
+```bash
+herdlet wait --id builder --match 'listening on|ERROR' --timeout 550
+```
+
+existing content matches immediately, then it polls every 2s. exit 0 =
+matched (`result.line` says what), 2 = timeout.
+
+if your shell tool has its own timeout, size the wait just under the tool's
+cap: every extra wake-up costs a full model turn. Claude Code's Bash defaults
+to 2 minutes but takes a `timeout` parameter up to 600000 ms; pass that and
+wait in ~550s chunks instead of many 90s ones. where the cap can't be raised,
+loop chunks inside a single call:
 
 ```bash
 while true; do
@@ -86,6 +112,8 @@ herdlet peek --id builder --lines 60
 ```
 
 this is that pane's visible scrollback tail, exactly what a human would see.
+pass `--join` to unwrap soft-wrapped lines - better when grepping logs or
+transcripts.
 
 ## send instructions to another agent
 
@@ -96,18 +124,45 @@ herdlet send --id builder "run the full test suite and report failures"
 the text is typed into that agent's terminal and submitted with Enter, as if
 its human had typed it. if the target agent is mid-turn, the message queues
 like normal user input. use `--no-enter` to type without submitting.
+multi-line text is delivered as one bracketed paste, so embedded newlines
+read as text instead of submitting early.
 
 ## spawn a worker agent
 
 ```bash
 tmux split-window -d -P -F '#{pane_id}' \
-  "HERDLET_ID=worker claude -p 'run the tests and summarize failures'"
-herdlet wait --id worker --state done,blocked --timeout 900
+  "HERDLET_ID=worker claude --model sonnet -p 'run the tests and summarize failures'"
+herdlet wait --id worker --state done,blocked --timeout 550
 herdlet peek --id worker --lines 40
 ```
 
 interactive workers are the same without `-p`; after they register you drive
 them with `send` / `wait` / `peek` cycles.
+
+**pick a model and effort per role - never spawn bare `claude`.** a worker
+without `--model` inherits the human's default model, often their most
+expensive tier; a herd of those burns tokens fast. cheap tiers for mechanical
+roles (test runners, seeders, formatters), a mid tier for implementers, top
+tier only where the hard thinking happens (usually you, the coordinator).
+high effort/thinking settings multiply output tokens on every turn of that
+worker's life, so reserve them for genuinely hard design work, never for
+mechanical roles.
+
+**provision permissions at spawn time.** an unattended worker that hits a
+permission menu just sits there until someone presses a key; a worker that
+prompts on every shell command turns you into a full-time babysitter. make
+the menus not appear:
+
+- pre-seed the allowlist in the worker's cwd before spawning: add the command
+  shapes the role will need (`Bash(pnpm *)`, `Bash(docker *)`, ...) to
+  `.claude/settings.local.json` under `permissions.allow`
+- disposable worktree or sandbox: `--permission-mode bypassPermissions` is
+  fine when the blast radius is contained
+- otherwise scope at launch: `--allowedTools "Bash(pnpm *)" "Bash(git diff *)"`
+
+note `--permission-mode acceptEdits` only auto-allows file edits; every shell
+command still prompts. answering menus by hand (see "unblock a worker") is
+the exception path, not the loop.
 
 ## act as a master orchestrator
 
@@ -118,8 +173,8 @@ window with one pane per role, then relay work between them:
 ```bash
 tmux new-window -t personal -n herdlet -c ~/code/herdlet
 tmux split-window -h -t personal:herdlet
-tmux send-keys -t personal:herdlet.0 "HERDLET_ID=personal/herdlet/dev CC_IMESSAGE_SKIP=1 claude" Enter
-tmux send-keys -t personal:herdlet.1 "HERDLET_ID=personal/herdlet/tester CC_IMESSAGE_SKIP=1 claude" Enter
+tmux send-keys -t personal:herdlet.0 "HERDLET_ID=personal/herdlet/dev CC_IMESSAGE_SKIP=1 claude --model sonnet" Enter
+tmux send-keys -t personal:herdlet.1 "HERDLET_ID=personal/herdlet/tester CC_IMESSAGE_SKIP=1 claude --model haiku" Enter
 herdlet wait --id personal/herdlet/dev --state idle --timeout 30   # registered?
 ```
 
@@ -129,11 +184,34 @@ the reverse also exists: `HERDLET_SKIP=1` makes herdlet ignore a nested
 agent run entirely; set it when a hook or script of yours shells out to
 `claude -p` from inside an agent's pane environment.
 
-then loop: `send` a role its task, chunked `wait --state done,blocked`,
-`peek` for the outcome, pass results to the next role, report to the user.
+then loop: `send` a role its task, one long `wait --state done,blocked` on
+all roles at once (`--id a,b` or `--prefix proj/`), `peek` for the outcome,
+pass results to the next role, report to the user.
 relay `peek` summaries, not whole transcripts, to keep your own context small.
+after collecting a worker's result, `herdlet ack --id <worker>` flips its
+`done` back to `idle` - then `list` reads as an inbox: `done` means results
+you have not collected yet.
 switching projects means a new window; leave finished windows alive so the
 user can inspect them.
+
+**keep workers short-lived.** a worker that lives for hours drags an
+ever-growing context into every one of its turns; the tail of a fat session
+is its most expensive stretch. prefer one worker per phase or milestone: it
+reads a brief file, does its slice, reports, and is retired; the next phase
+gets a fresh worker. hand phases over through brief files on disk
+(`plans/*.md`), not through a long-lived worker's memory.
+
+**heavy fan-out skills are budget events.** skills that spawn many subagents
+at once (multi-agent code review, research harnesses) run every subagent on
+the calling session's model and count against its usage limits. NEVER run an
+out-of-the-box code-review slash command from a herd session: at high effort
+it bursts 8+ finder subagents on the master's expensive model in one shot -
+enough to trip a session limit and stall the whole herd. review herd-natively
+instead: spawn one-shot reviewer workers on cheap models that read
+pre-gathered context from disk, then synthesize their findings yourself (if a
+distilled herd review skill is installed - e.g. ponytail-review - use it).
+if a limit does kill subagents mid-flight, resume them after the reset
+instead of respawning; a respawned agent redoes all of its work.
 
 ## unblock a worker (questions and permission prompts)
 
@@ -142,23 +220,46 @@ ended its turn by asking you something. either way `peek` first, then:
 
 - **question in plain text**: answer it like a user would:
   `herdlet send --id herdlet/dev "yes, proceed with both releases"`
-- **permission menu** (numbered options): menus react to a single keypress,
-  so use tmux directly; `send` would append Enter:
+- **permission menu** (numbered options): `approve` presses the option key
+  (menus react to a bare keypress; `send` would append Enter) and echoes the
+  pane so you see it took:
 
   ```bash
-  tmux send-keys -t %5 1        # approve once (pane id from herdlet list)
-  tmux send-keys -t %5 3        # deny; then `send` a corrective instruction
-  tmux send-keys -t %5 Escape   # dismiss a dialog
+  herdlet approve --id herdlet/dev              # option 1: approve once
+  herdlet approve --id herdlet/dev --option 3   # deny; then `send` a corrective instruction
+  tmux send-keys -t %5 Escape                   # dismiss a dialog
   ```
 
 rules of thumb: approve only what matches the task you assigned; deny with a
 follow-up instruction if the action looks off-task; escalate to the human
 instead of guessing on anything destructive, irreversible, or outward-facing
-(pushes, publishes, deletes). avoid "always allow" menu options unless the
-human said so, they persist beyond this task. a denied permission fires no
-hook, so after answering a menu re-check with `get` rather than `wait`. for
-trusted bulk work, cut the prompt noise at spawn time instead:
-`claude --permission-mode acceptEdits`.
+(pushes, PR creation, publishes, deletes) - milestones in a plan or handoff
+doc describe the goal, not permission to do these yourself. a denied permission fires no hook, so after
+answering a menu re-check with `get` rather than `wait`.
+
+if you are approving the same class of command over and over, stop: that is a
+provisioning failure, not a babysitting duty. pick the menu's "always allow"
+option, or add the command shape to the worker's `.claude/settings.local.json`
+allowlist, and get out of the loop (see "provision permissions at spawn
+time"). reserve one-off approvals for commands that genuinely warrant
+case-by-case judgment.
+
+## resume a dead worker
+
+agent hooks record each agent's native session ref (`session` in `get`).
+when a worker's process dies without a hook firing - crash, usage limit,
+accidental ctrl-c - its pane drops back to a shell and `list` shows the
+agent as `stale`. do NOT respawn from scratch: a respawned agent redoes all
+of its work, a resumed one continues with its context intact.
+
+```bash
+herdlet resume --id gtax/impl             # types `claude --resume <session>` into its pane
+herdlet resume --id gtax/impl --pane %7   # pane died too: spawn a fresh one, resume there
+```
+
+`resume` refuses to type into a pane that is running something other than a
+bare shell (`--force` overrides). after the agent comes back, `send` it a
+short "where were we" nudge so it re-anchors and continues.
 
 ## report state manually
 
@@ -183,11 +284,14 @@ herdlet watch --state blocked # who just got stuck
   own hook, which takes a moment. waiting instantly can match its stale `done`.
 - ids are live registry entries; re-read `herdlet list` rather than assuming
   an old id still exists.
-- `send` is terminal input: keep it one line, no control sequences needed.
+- `send` is terminal input: no control sequences. multi-line text is fine
+  (delivered as a bracketed paste).
 - waiting only on `done` can hang forever if the target hits a permission
   prompt; include `blocked`.
 - a denied permission interrupts the turn without firing any hook, so
   `blocked` can linger until the target's next event. an old `blocked` with a
-  quiet pane means a human already acted; `peek` before trusting it.
+  quiet pane means a human already acted; `peek` before trusting it. if the
+  agent process itself died, `list` shows `stale` instead - that one needs
+  `resume`, not a keypress.
 - if the daemon was restarted, agents re-register on their next hook event;
   a missing entry does not necessarily mean the pane is dead. `peek` it.
