@@ -25,7 +25,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.4.2"
+__version__ = "0.4.3"
 
 DEFAULT_SOCK = os.environ.get("HERDLET_SOCKET", os.path.expanduser("~/.herdlet.sock"))
 LOG_PATH = os.path.expanduser("~/.herdlet.log")

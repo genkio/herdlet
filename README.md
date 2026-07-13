@@ -162,9 +162,14 @@ a tester, requirement is ...", and it runs
 ```bash
 tmux new-window -t personal -n herdlet -c ~/code/herdlet
 tmux split-window -h -t personal:herdlet
-tmux send-keys -t personal:herdlet.0 "HERDLET_ID=personal/herdlet/dev claude --model sonnet" Enter
-tmux send-keys -t personal:herdlet.1 "HERDLET_ID=personal/herdlet/tester claude --model haiku" Enter
+tmux send-keys -t personal:herdlet.0 "HERDLET_ID=personal/herdlet/dev $LAUNCH --model <mid-id>" Enter
+tmux send-keys -t personal:herdlet.1 "HERDLET_ID=personal/herdlet/tester $LAUNCH --model <cheap-id>" Enter
 ```
+
+(`$LAUNCH` = however you launch your agent - `claude`, `codex`, or a wrapper
+that sets a custom endpoint/model; swap `<mid-id>`/`<cheap-id>` for model ids
+valid in your setup. a worker is a top-level session, so it takes your MAIN
+model unless you downgrade it explicitly - that is the cost lever.)
 
 then drives the pair with `send` / `wait --state done,blocked` / `peek`,
 relaying between roles and reporting back to you. Hours later, "now genkia"
@@ -188,7 +193,7 @@ npx skills add genkio/herdlet        # Claude Code, Codex, Cursor, ...
 
 ```bash
 # spawn a worker in a new pane, wait for it, read its result
-tmux split-window -d -P -F '#{pane_id}' "HERDLET_ID=worker claude --model sonnet -p 'run the test suite'"
+tmux split-window -d -P -F '#{pane_id}' "HERDLET_ID=worker $LAUNCH --model <cheap-id> -p 'run the test suite'"
 herdlet wait --id worker --state done,blocked --timeout 900
 herdlet peek --id worker --lines 40
 herdlet send --id worker "now fix the failing test"
@@ -197,11 +202,11 @@ herdlet send --id worker "now fix the failing test"
 The waiter is woken by a push from the daemon, not a polling loop.
 
 The skill bakes in the economics lessons of running herds for real: pick a
-model per role (a bare `claude` inherits the human's default, often their
-most expensive tier), provision worker permissions at spawn time instead of
-babysitting menus, wait on the whole herd in one long call, and prefer
-short-lived phase-scoped workers over one pane dragging a huge context
-through an entire project.
+model per role by tier, never by inheriting the default (a worker launched
+bare takes your priciest MAIN model - a herd of those burns tokens fast),
+provision worker permissions at spawn time instead of babysitting menus, wait
+on the whole herd in one long call, and prefer short-lived phase-scoped workers
+over one pane dragging a huge context through an entire project.
 
 ## Protocol
 

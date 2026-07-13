@@ -25,8 +25,10 @@ this means you can:
 
 **states**: `idle`, `working`, `blocked`, `done` (custom strings allowed).
 `blocked` means the agent is waiting for a human approval; `done` means its
-turn finished. states update automatically via Claude Code / Codex hooks, you
-normally never report your own state.
+turn finished. states update automatically via your harness's hooks (herdlet
+ships Claude Code + Codex wiring), so you normally never report your own state;
+an agent with no hook integration is tracked manually (`herdlet report`) or by
+its output (`herdlet wait --match`).
 
 **ids**: an agent's id is `$HERDLET_ID` if it was launched with one,
 otherwise its tmux pane id like `%5`. ids come from `herdlet list`; do not
@@ -139,14 +141,26 @@ read as text instead of submitting early.
 
 ## spawn a worker agent
 
-a bare `claude -p` pane CLOSES the moment the agent exits, destroying its
+spawn a worker with the **same launch command you were started under**, not a
+bare vendor binary. that command carries your model routing, endpoint/auth env,
+and per-role config; a bare `claude`/`codex` in a fresh pane inherits none of it
+and may hit the wrong endpoint or an unconfigured model. call it `$LAUNCH` below
+and substitute your own:
+
+| harness | `$LAUNCH` |
+|---|---|
+| Claude Code | `claude` |
+| Claude Code via a custom endpoint (a wrapper you wrote that sets base url / key / model) | that wrapper |
+| Codex | `codex` |
+
+a bare `$LAUNCH -p` pane CLOSES the moment the agent exits, destroying its
 scrollback - by the time you peek, the result is gone. for one-shot workers,
 tee the output to a file, keep the pane alive, and have the worker end with
 a sentinel line YOU chose (matching on guessed output vocabulary misses):
 
 ```bash
 tmux split-window -d -P -F '#{pane_id}' "sh -c \"HERDLET_ID=worker \
-  claude --model sonnet -p 'run the tests and summarize failures; end your \
+  $LAUNCH --model <cheap-id> -p 'run the tests and summarize failures; end your \
   output with the line WORKER_DONE' | tee /tmp/worker.out; sleep 3600\""
 herdlet wait --id worker --state done,blocked --timeout 550   # or: --match WORKER_DONE
 cat /tmp/worker.out           # the result; then kill the pane
@@ -156,16 +170,23 @@ interactive workers don't have the exit race - the TUI keeps the pane open:
 
 ```bash
 tmux split-window -d -P -F '#{pane_id}' \
-  "HERDLET_ID=worker claude --model sonnet"
+  "HERDLET_ID=worker $LAUNCH --model <cheap-id>"
 ```
 
 after they register you drive them with `send` / `wait` / `peek` cycles.
 
-**pick a model and effort per role - never spawn bare `claude`.** a worker
-without `--model` inherits the human's default model, often their most
-expensive tier; a herd of those burns tokens fast. cheap tiers for mechanical
-roles (test runners, seeders, formatters), a mid tier for implementers, top
-tier only where the hard thinking happens (usually you, the coordinator).
+**always launch a worker with an explicit model - never let it inherit the
+default.** a herdlet worker is its own top-level session, not a subagent, so it
+runs on `$LAUNCH`'s MAIN (priciest) model unless you say otherwise - that is how
+a top-tier master ends up spawning top-tier workers and burns the budget fast.
+downgrade mechanical roles explicitly, with a model id valid for YOUR setup:
+
+| tier | role | Claude Code | Claude Code on Fireworks |
+|---|---|---|---|
+| cheap | test runners, seeders, formatters | `--model haiku` | `--model accounts/fireworks/models/minimax-m3` |
+| mid | implementers | `--model sonnet` | bare `$LAUNCH` (main = glm-5p2) |
+| top | hard thinking (usually you) | `--model opus` | bare `$LAUNCH` (main = glm-5p2) |
+
 high effort/thinking settings multiply output tokens on every turn of that
 worker's life, so reserve them for genuinely hard design work, never for
 mechanical roles.
@@ -173,7 +194,8 @@ mechanical roles.
 **provision permissions at spawn time.** an unattended worker that hits a
 permission menu just sits there until someone presses a key; a worker that
 prompts on every shell command turns you into a full-time babysitter. make
-the menus not appear:
+the menus not appear, using your harness's own permission mechanism. for
+Claude Code:
 
 - pre-seed the allowlist in the worker's cwd before spawning: add the command
   shapes the role will need (`Bash(pnpm *)`, `Bash(docker *)`, ...) to
@@ -182,15 +204,16 @@ the menus not appear:
   fine when the blast radius is contained
 - otherwise scope at launch: `--allowedTools "Bash(pnpm *)" "Bash(git diff *)"`
 
-note `--permission-mode acceptEdits` only auto-allows file edits; every shell
-command still prompts. answering menus by hand (see "unblock a worker") is
-the exception path, not the loop.
+(`--permission-mode acceptEdits` only auto-allows file edits; every shell
+command still prompts.) other harnesses have their own allowlist/sandbox
+flags - check `$LAUNCH --help`. answering menus by hand (see "unblock a
+worker") is the exception path, not the loop.
 
 **pre-registration blind spot.** keep the pane id `split-window -P` printed
 you; until the worker's first hook event it has no registry entry at all, so
-it is only addressable by that pane id. a first run in a new directory blocks
-on the folder-trust dialog BEFORE any hook exists - `peek` / `approve` that
-worker by pane id (`%N`), not by the name you gave it.
+it is only addressable by that pane id. a first run in a new directory can
+block on a trust/onboarding prompt BEFORE any hook exists - `peek` / `approve`
+that worker by pane id (`%N`), not by the name you gave it.
 
 **brief your workers on cwd.** commands run from the worker's own cwd; if you
 tell it to `cd X && ...` for another repo, that prefix defeats prefix-based
@@ -206,16 +229,17 @@ window with one pane per role, then relay work between them:
 ```bash
 tmux new-window -t personal -n herdlet -c ~/code/herdlet
 tmux split-window -h -t personal:herdlet
-tmux send-keys -t personal:herdlet.0 "HERDLET_ID=personal/herdlet/dev CC_IMESSAGE_SKIP=1 claude --model sonnet" Enter
-tmux send-keys -t personal:herdlet.1 "HERDLET_ID=personal/herdlet/tester CC_IMESSAGE_SKIP=1 claude --model haiku" Enter
+tmux send-keys -t personal:herdlet.0 "HERDLET_ID=personal/herdlet/dev CC_IMESSAGE_SKIP=1 $LAUNCH --model <mid-id>" Enter
+tmux send-keys -t personal:herdlet.1 "HERDLET_ID=personal/herdlet/tester CC_IMESSAGE_SKIP=1 $LAUNCH --model <cheap-id>" Enter
 herdlet wait --id personal/herdlet/dev --state idle --timeout 30   # registered?
 ```
 
 spawn workers with the mute env vars of any per-turn notification hooks the
 user runs (like `CC_IMESSAGE_SKIP=1` above), so only masters page the human.
 the reverse also exists: `HERDLET_SKIP=1` makes herdlet ignore a nested
-agent run entirely; set it when a hook or script of yours shells out to
-`claude -p` from inside an agent's pane environment.
+agent run entirely; set it when a hook or script of yours shells out to a
+nested agent (`claude -p`, `codex exec`) from inside an agent's pane
+environment.
 
 then loop: `send` a role its task, one long `wait --state done,blocked` on
 all roles at once (`--id a,b` or `--prefix proj/`), `peek` for the outcome,
@@ -291,7 +315,7 @@ agent as `stale`. do NOT respawn from scratch: a respawned agent redoes all
 of its work, a resumed one continues with its context intact.
 
 ```bash
-herdlet resume --id gtax/impl             # types `claude --resume <session>` into its pane
+herdlet resume --id gtax/impl             # types the agent's native resume command (claude --resume / codex resume)
 herdlet resume --id gtax/impl --pane %7   # pane died too: spawn a fresh one, resume there
 ```
 
