@@ -19,6 +19,14 @@ subset of [herdr](https://github.com/ogulcancelik/herdr)'s socket API
 multiplexer, use herdr. If you want to keep your tmux setup and just add the
 coordination layer, use herdlet.
 
+Last herdr idea-scan: **v0.7.3** (commit `3b8aeee`, 2026-07). Borrowed as of
+herdlet 0.4.x: session-ref capture for `resume`, process-liveness `stale`
+detection, the seen-bit (`ack`), output-match waits, bracketed-paste `send`,
+registry persistence. Deliberately skipped: screen-scraping detection
+manifests (high maintenance; hooks suffice) and live server handoff (tmux
+owns the PTYs, so the problem doesn't exist here). To mine future herdr
+releases, diff its CHANGELOG from v0.7.3 forward.
+
 Single file, stdlib only, no dependencies beyond python3 and tmux.
 
 ## Install
