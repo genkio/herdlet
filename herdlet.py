@@ -25,16 +25,26 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.4.3"
+__version__ = "0.5.0"
 
 DEFAULT_SOCK = os.environ.get("HERDLET_SOCKET", os.path.expanduser("~/.herdlet.sock"))
 LOG_PATH = os.path.expanduser("~/.herdlet.log")
-STATES = ("idle", "working", "blocked", "done", "unknown")
+STATES = ("idle", "working", "blocked", "done", "ended", "unknown")
+TERMINAL = ("done", "ended")  # agent's turn/session finished; record kept for collection + resume
 MERGE_KEYS = ("message", "agent", "pane", "cwd", "session")
 SHELLS = {"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "nu"}
+# A pane sitting at a shell only means the agent DIED if it also stopped
+# reporting. A live agent (wrapper script, `claude -p` piped to tee, a shell
+# tool call) can legitimately show a shell as pane_current_command while its
+# hooks keep the record fresh, so only call it stale once the record goes quiet.
+STALE_AFTER = 60.0
+# Terminal records older than this are pruned on daemon load so a long-lived
+# socket doesn't accumulate dead agents forever.
+TERMINAL_TTL = 86400.0
 RESUME = {
     "claude": "claude --resume {session}",
     "codex": "codex resume {session}",
+    "opencode": "opencode --session {session}",
 }
 
 
@@ -56,6 +66,13 @@ class Bus:
                 self.agents = data["agents"]
         except (OSError, json.JSONDecodeError):
             pass  # best-effort: a bad snapshot just means an empty registry
+        # Terminal records persist across restarts (so resume survives one), but
+        # drop the long-dead ones so the registry doesn't grow without bound.
+        cutoff = time.time() - TERMINAL_TTL
+        self.agents = {
+            aid: rec for aid, rec in self.agents.items()
+            if not (rec.get("state") in TERMINAL and rec.get("updated", 0) < cutoff)
+        }
 
     def _save(self):
         if not self.state_path:
@@ -431,8 +448,9 @@ def cmd_remove(args):
 
 
 def sort_key(rec):
-    order = {"blocked": 0, "stale": 1, "working": 2, "done": 3, "idle": 4}
-    return (order.get(rec["state"], 5), -rec["updated"])
+    order = {"blocked": 0, "stale": 1, "gone": 2, "working": 3, "done": 4,
+             "ended": 5, "idle": 6}
+    return (order.get(rec["state"], 7), -rec["updated"])
 
 
 def age(seconds):
@@ -452,9 +470,14 @@ def annotate(agents, panes):
         if pane and panes and pane not in panes:
             rec["state"] = "gone"
         info = panes.get(pane) if pane else None
-        # agent process exited without a hook firing (deny, crash, ctrl-c):
-        # the pane is back at a bare shell while the record says otherwise
-        if info and rec["state"] in ("working", "blocked") and info.get("command") in SHELLS:
+        # agent process exited without a hook firing (deny, crash, ctrl-c): the
+        # pane is back at a bare shell AND the record has gone quiet. The
+        # freshness check is what keeps a just-spawned or actively-hooking worker
+        # (whose pane_current_command is a shell) from being called stale while
+        # it is plainly alive - the friction that made one-shot workers unusable.
+        if (info and rec["state"] in ("working", "blocked")
+                and info.get("command") in SHELLS
+                and now - rec["updated"] > STALE_AFTER):
             rec["state"] = "stale"
         rec["where"] = f"{info['session']}:{info['window_index']} {info['window_name']}" if info else ""
         rec["age"] = age(now - rec["updated"])
@@ -650,6 +673,30 @@ def _install_skill(dest_dir):
     return f"{dest}: installed"
 
 
+def _opencode_plugin_source():
+    here = os.path.dirname(os.path.realpath(__file__))
+    for cand in (os.path.join(here, "integrations", "opencode", "herdlet.js"),
+                 os.path.normpath(os.path.join(here, "..", "share", "doc",
+                                               "herdlet", "opencode-herdlet.js"))):
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+def _install_opencode_plugin():
+    # opencode auto-loads any *.js/*.ts in its global plugins dir. Unlike Claude
+    # and Codex it has no shell-hook config, so the bridge is a plugin file.
+    dest = os.path.expanduser("~/.config/opencode/plugins/herdlet.js")
+    if os.path.lexists(dest):
+        return f"{dest}: already present, skipped"
+    source = _opencode_plugin_source()
+    if source is None:
+        return "opencode plugin not found next to this install, skipped"
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.copyfile(source, dest)
+    return f"{dest}: installed"
+
+
 def cmd_setup(args):
     home = os.path.expanduser("~")
 
@@ -673,6 +720,8 @@ def cmd_setup(args):
     if added:
         _save_json(path, cfg)
     print(f"codex hooks  : {'wired ' + ', '.join(added) if added else 'already wired'}")
+
+    print(f"opencode plug: {_install_opencode_plugin()}")
 
     print(f"claude skill : {_install_skill(os.path.join(home, '.claude', 'skills'))}")
     print(f"codex skill  : {_install_skill(os.path.join(home, '.codex', 'skills'))}")
@@ -699,7 +748,17 @@ def cmd_hook(args):
             return 0
 
         if event == "SessionEnd":
-            call(args.socket, "agent.remove", {"id": agent_id}, timeout=1.0)
+            # Keep the record instead of deleting it: a finished OR crashed agent
+            # stays visible in `list` and, crucially, keeps its session ref so
+            # `herdlet resume` can bring it back. `remove` (or `ack`) is the
+            # explicit way to clear it. pane/cwd are preserved by omission
+            # (absent != "" clear); only session is refreshed if the event has one.
+            params = {"id": agent_id, "state": "ended", "agent": args.agent}
+            if data.get("session_id"):
+                params["session"] = squash(str(data["session_id"]), 200)
+            if not ensure_daemon(args.socket):
+                return 0
+            call(args.socket, "agent.report", params, timeout=1.0)
             return 0
         state = HOOK_STATES.get(event)
         if state is None:
@@ -763,6 +822,10 @@ def cmd_ack(args):
         if rec["state"] == "done":
             call_or_die(args.socket, "agent.report", {"id": agent_id, "state": "idle"})
             print(f"{agent_id}: done -> idle")
+        elif rec["state"] == "ended":
+            # dead + collected: clear it so `list` stays an inbox of live work
+            call_or_die(args.socket, "agent.remove", {"id": agent_id})
+            print(f"{agent_id}: ended -> removed")
         else:
             print(f"{agent_id}: {rec['state']} (nothing to ack)")
     return 1 if missing else 0
@@ -848,7 +911,7 @@ def cmd_approve(args):
 
 COLORS = {"working": "\033[33m", "blocked": "\033[1;31m", "done": "\033[32m",
           "idle": "\033[2m", "unknown": "\033[2m", "gone": "\033[35m",
-          "stale": "\033[31m"}
+          "stale": "\033[31m", "ended": "\033[2m"}
 RESET = "\033[0m"
 DIM = "\033[2m"
 BOLD = "\033[1m"

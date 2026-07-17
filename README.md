@@ -1,7 +1,7 @@
 # herdlet
 
-Tiny coordination bus for coding agents (Claude Code, Codex, ...) running in
-tmux panes.
+Tiny coordination bus for coding agents (Claude Code, Codex, opencode, ...)
+running in tmux panes.
 
 tmux already gives you the multiplexing and the pane I/O (`send-keys`,
 `capture-pane`). What it doesn't have is the layer that makes multi-agent
@@ -92,17 +92,26 @@ never blocks, and always exits 0, so it is safe in any hook chain.
 | UserPromptSubmit, PreToolUse, PostToolUse | working |
 | Notification (permission), PermissionRequest | blocked |
 | Stop | done |
-| SessionEnd | removed from registry |
+| SessionEnd | ended (record kept, with its session ref) |
 
 The prompt text becomes the agent's `message`, so `list` / `monitor` show
 what each agent is working on. Hooks also record the agent's native session
 id, which is what powers `herdlet resume` (types `claude --resume <id>` /
-`codex resume <id>` into the pane after a crash or usage-limit kill).
+`codex resume <id>` / `opencode --session <id>` into the pane after a crash or
+usage-limit kill). A finished session becomes `ended` rather than vanishing, so
+you can still collect its output and resume it; `herdlet remove` (or `ack`)
+clears it, and long-dead terminal records are pruned automatically.
+
+opencode has no shell-hook config, so `herdlet setup` installs a small plugin
+(`~/.config/opencode/plugins/herdlet.js`) that reports the same states from
+opencode's event stream.
 
 `list` and `monitor` cross-check the registry against reality: an agent
 whose pane is gone shows `gone`; one whose pane fell back to a bare shell
-while hooks last said working/blocked shows `stale` (the process died
-without a hook firing - resume it).
+*and whose record has gone quiet* shows `stale` (the process died without a
+hook firing - resume it). A live worker whose pane merely shows a shell (a
+wrapper script, `-p` piped to `tee`, a shell tool call) is not flagged, because
+its hooks keep the record fresh.
 
 `herdlet setup` wires all of this for you; the snippets below are the manual
 reference. Claude Code `settings.json` (same pattern for Codex `hooks.json`,

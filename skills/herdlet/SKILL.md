@@ -23,11 +23,13 @@ this means you can:
 
 ## concepts
 
-**states**: `idle`, `working`, `blocked`, `done` (custom strings allowed).
-`blocked` means the agent is waiting for a human approval; `done` means its
-turn finished. states update automatically via your harness's hooks (herdlet
-ships Claude Code + Codex wiring), so you normally never report your own state;
-an agent with no hook integration is tracked manually (`herdlet report`) or by
+**states**: `idle`, `working`, `blocked`, `done`, `ended` (custom strings
+allowed). `blocked` means the agent is waiting for a human approval; `done`
+means its turn finished; `ended` means the whole session exited - the record is
+KEPT (with its session ref) so you can still see it and `resume` it. states
+update automatically via your harness's hooks (`herdlet setup` wires Claude
+Code, Codex, and an opencode plugin), so you normally never report your own
+state; an agent with no integration is tracked manually (`herdlet report`) or by
 its output (`herdlet wait --match`).
 
 **ids**: an agent's id is `$HERDLET_ID` if it was launched with one,
@@ -53,10 +55,13 @@ herdlet list --json             # machine-readable
 herdlet get --id herdlet/tester
 ```
 
-a state of `gone` means the agent's pane no longer exists. a state of
-`stale` means the pane is back at a bare shell while the last hook said
-working/blocked - the agent process died (crash, usage limit, ctrl-c)
-without a hook firing. see "resume a dead worker".
+`gone` means the agent's pane no longer exists. `stale` means the pane is back
+at a bare shell AND the record has gone quiet - the agent process died (crash,
+usage limit, ctrl-c) without a hook firing. a live worker whose pane happens to
+show a shell (a wrapper script, `-p` piped to `tee`, a shell tool call) is NOT
+flagged stale: its hooks keep the record fresh, and only a record that stops
+updating trips the check. `ended` is a clean session exit. all three keep the
+record, so see "resume a dead worker".
 
 ## wait for another agent
 
@@ -152,19 +157,37 @@ and substitute your own:
 | Claude Code | `claude` |
 | Claude Code via a custom endpoint (a wrapper you wrote that sets base url / key / model) | that wrapper |
 | Codex | `codex` |
+| opencode | `opencode` (the `herdlet setup` plugin reports its state) |
 
 a bare `$LAUNCH -p` pane CLOSES the moment the agent exits, destroying its
-scrollback - by the time you peek, the result is gone. for one-shot workers,
-tee the output to a file, keep the pane alive, and have the worker end with
-a sentinel line YOU chose (matching on guessed output vocabulary misses):
+scrollback - by the time you peek, the result is gone. wrap a one-shot worker
+in a shell that keeps the pane alive and emits its own done-marker AFTER the CLI
+returns:
 
 ```bash
-tmux split-window -d -P -F '#{pane_id}' "sh -c \"HERDLET_ID=worker \
-  $LAUNCH --model <cheap-id> -p 'run the tests and summarize failures; end your \
-  output with the line WORKER_DONE' | tee /tmp/worker.out; sleep 3600\""
-herdlet wait --id worker --state done,blocked --timeout 550   # or: --match WORKER_DONE
-cat /tmp/worker.out           # the result; then kill the pane
+tmux split-window -d -P -F '#{pane_id}' "bash -c '\
+  HERDLET_ID=proj/worker $LAUNCH --model <cheap-id> \
+    --allowedTools Read Edit \"Bash(pnpm *)\" \
+    -p \"read plans/worker.md and do it\" | tee /tmp/worker.out; \
+  echo exit=\${PIPESTATUS[0]} > /tmp/worker.done; sleep 3600'"
+herdlet wait --id proj/worker --state done,blocked --timeout 550
 ```
+
+three rules baked into that wrapper, each a real failure it prevents:
+
+- **the sentinel goes in the WRAPPER, never in the prompt.** telling the agent
+  "end your output with WORKER_DONE" backfires: that text echoes into the pane
+  the instant the prompt is submitted, so `wait --match WORKER_DONE` fires
+  immediately on the echo, not on completion. wait on the hook-driven `done`
+  state, or match a marker your shell writes after the CLI exits (the `.done`
+  file above) - never one the agent is told to print.
+- **`tee` eats the exit code.** `$?` after a pipe is `tee`'s (always 0); capture
+  the agent's real exit with `${PIPESTATUS[0]}` (bash).
+- **exit 0 is not "the job is done".** a `-p` worker can exit clean with a
+  half-finished task (an internal tool error it "recovered" past, a truncated
+  write). judge completion by the DELIVERABLE - `git status`, the file it was
+  told to produce, its own final report - not by the exit code or a done-marker
+  alone.
 
 interactive workers don't have the exit race - the TUI keeps the pane open:
 
@@ -245,11 +268,18 @@ then loop: `send` a role its task, one long `wait --state done,blocked` on
 all roles at once (`--id a,b` or `--prefix proj/`), `peek` for the outcome,
 pass results to the next role, report to the user.
 relay `peek` summaries, not whole transcripts, to keep your own context small.
-after collecting a worker's result, `herdlet ack --id <worker>` flips its
-`done` back to `idle` - then `list` reads as an inbox: `done` means results
-you have not collected yet.
+after collecting a worker's result, `herdlet ack --id <worker>` clears it from
+the inbox: a `done` (still-alive) worker flips back to `idle`, an `ended` (dead)
+one is removed. then `list` reads as an inbox of live work.
 switching projects means a new window; leave finished windows alive so the
 user can inspect them.
+
+**collect a worktree worker's diff atomically, before any cleanup.** if a worker
+ran in an isolated git worktree, snapshot everything it produced in one shot -
+`git -C <wt> add -A && git -C <wt> diff --cached` (plus copy any files you need)
+- BEFORE you `git checkout`/`clean`/reset that worktree for the next worker. a
+hand-rolled loop over `git status --porcelain` will trip over untracked
+directories and a premature `clean` can delete a deliverable you never captured.
 
 **keep workers short-lived.** a worker that lives for hours drags an
 ever-growing context into every one of its turns; the tail of a fat session
@@ -315,9 +345,12 @@ agent as `stale`. do NOT respawn from scratch: a respawned agent redoes all
 of its work, a resumed one continues with its context intact.
 
 ```bash
-herdlet resume --id gtax/impl             # types the agent's native resume command (claude --resume / codex resume)
+herdlet resume --id gtax/impl             # types the native resume command (claude --resume / codex resume / opencode --session)
 herdlet resume --id gtax/impl --pane %7   # pane died too: spawn a fresh one, resume there
 ```
+
+a session that exited cleanly shows `ended` (not `stale`) but resumes the same
+way - the record and its session ref are kept until you `remove`/`ack` it.
 
 `resume` refuses to type into a pane that is running something other than a
 bare shell (`--force` overrides). after the agent comes back, `send` it a

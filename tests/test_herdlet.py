@@ -327,9 +327,17 @@ class HerdletTest(unittest.TestCase):
         rec = self.parse(self.run_cli("get", "--id", "hk1"))["result"]
         self.assertEqual(rec["state"], "done")
 
-        self.run_cli("hook", stdin=json.dumps({"hook_event_name": "SessionEnd"}), env_extra=env)
-        proc = self.run_cli("get", "--id", "hk1")
-        self.assertEqual(proc.returncode, 1)
+        # SessionEnd keeps the record (state -> ended) with its session ref, so
+        # `list` still shows it and `resume` can bring it back; `remove` clears it.
+        self.run_cli("hook", stdin=json.dumps(
+            {"hook_event_name": "SessionEnd", "session_id": "sess-hk1"}), env_extra=env)
+        rec = self.parse(self.run_cli("get", "--id", "hk1"))["result"]
+        self.assertEqual(rec["state"], "ended")
+        self.assertEqual(rec["session"], "sess-hk1")
+
+        # ack on an ended (dead + collected) record removes it
+        self.run_cli("ack", "--id", "hk1")
+        self.assertEqual(self.run_cli("get", "--id", "hk1").returncode, 1)
 
     def test_hook_skip_env(self):
         self.parse(self.run_cli("report", "--id", "sk1", "--state", "done"))
@@ -412,6 +420,81 @@ class HerdletTest(unittest.TestCase):
             self.assertTrue(any("herdlet hook" in c for c in stop_cmds))
             self.assertTrue(os.path.exists(
                 os.path.join(claude_dir, "settings.json.herdlet-bak")))
+
+
+def _load_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("herdlet_mod", BIN)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class AnnotateTest(unittest.TestCase):
+    """Liveness annotation is pure over (records, panes), so test it directly
+    without tmux or a daemon."""
+
+    def setUp(self):
+        self.h = _load_module()
+
+    def rec(self, state, updated_ago=0.0, pane="%1"):
+        return {"state": state, "pane": pane, "updated": time.time() - updated_ago,
+                "message": "", "agent": "claude", "session": "s", "cwd": "/tmp"}
+
+    def test_fresh_worker_at_shell_stays_working(self):
+        # the friction: a just-spawned / actively-hooking worker whose pane shows
+        # a shell (wrapper script, `claude -p | tee`, shell tool call) is alive
+        agents = [self.rec("working", updated_ago=0)]
+        panes = {"%1": {"session": "h", "window_index": "1", "window_name": "w",
+                        "command": "zsh"}}
+        out = self.h.annotate(agents, panes)
+        self.assertEqual(out[0]["state"], "working")
+
+    def test_quiet_worker_at_shell_is_stale(self):
+        # a genuinely dead agent stops reporting: old record + pane back at a shell
+        agents = [self.rec("working", updated_ago=self.h.STALE_AFTER + 30)]
+        panes = {"%1": {"session": "h", "window_index": "1", "window_name": "w",
+                        "command": "zsh"}}
+        out = self.h.annotate(agents, panes)
+        self.assertEqual(out[0]["state"], "stale")
+
+    def test_missing_pane_is_gone(self):
+        agents = [self.rec("working", updated_ago=0, pane="%404")]
+        out = self.h.annotate(agents, {"%1": {"session": "h", "window_index": "1",
+                                              "window_name": "w", "command": "node"}})
+        self.assertEqual(out[0]["state"], "gone")
+
+    def test_worker_running_agent_binary_never_stale(self):
+        # pane_current_command is the agent runtime, not a shell -> always alive
+        agents = [self.rec("working", updated_ago=self.h.STALE_AFTER + 30)]
+        panes = {"%1": {"session": "h", "window_index": "1", "window_name": "w",
+                        "command": "node"}}
+        out = self.h.annotate(agents, panes)
+        self.assertEqual(out[0]["state"], "working")
+
+
+class LoadPruneTest(unittest.TestCase):
+    def test_ancient_terminal_records_pruned_on_load(self):
+        h = _load_module()
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.state")
+            now = time.time()
+            with open(path, "w") as fh:
+                json.dump({"agents": {
+                    "old/ended": {"state": "ended", "updated": now - h.TERMINAL_TTL - 100,
+                                  "session": "x", "pane": "%1", "message": "", "agent": "c",
+                                  "cwd": "/tmp"},
+                    "recent/ended": {"state": "ended", "updated": now,
+                                     "session": "y", "pane": "%2", "message": "", "agent": "c",
+                                     "cwd": "/tmp"},
+                    "live/working": {"state": "working", "updated": now - h.TERMINAL_TTL - 100,
+                                     "session": "z", "pane": "%3", "message": "", "agent": "c",
+                                     "cwd": "/tmp"},
+                }}, fh)
+            bus = h.Bus(state_path=path)
+            self.assertNotIn("old/ended", bus.agents)     # ancient + terminal -> pruned
+            self.assertIn("recent/ended", bus.agents)      # terminal but fresh -> kept
+            self.assertIn("live/working", bus.agents)      # non-terminal -> kept regardless of age
 
 
 if __name__ == "__main__":
