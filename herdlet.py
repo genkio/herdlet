@@ -25,7 +25,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 DEFAULT_SOCK = os.environ.get("HERDLET_SOCKET", os.path.expanduser("~/.herdlet.sock"))
 LOG_PATH = os.path.expanduser("~/.herdlet.log")
@@ -41,6 +41,13 @@ STALE_AFTER = 60.0
 # Terminal records older than this are pruned on daemon load so a long-lived
 # socket doesn't accumulate dead agents forever.
 TERMINAL_TTL = 86400.0
+# A blocked agent's state is emitted once, on the hook that fired it - the
+# harness has no "still waiting" event. So the daemon re-announces `blocked`
+# to waiters every BLOCKED_REEMIT seconds, so a `wait` (especially `--edge`)
+# that STARTED after the agent was already blocked still wakes instead of
+# starving. Waiters only, not subscribers (`watch` stays a pure change stream;
+# `monitor` already re-polls on its own tick). 0 disables.
+BLOCKED_REEMIT = float(os.environ.get("HERDLET_BLOCKED_REEMIT", "30"))
 RESUME = {
     "claude": "claude --resume {session}",
     "codex": "codex resume {session}",
@@ -54,6 +61,7 @@ class Bus:
         self.agents = {}       # id -> record
         self.subscribers = set()  # (queue, id_filter, state_filter)
         self.waiters = []      # (predicate, future)
+        self._reemit = {}      # id -> TimerHandle: live re-announce of `blocked`
         self._load()
 
     def _load(self):
@@ -73,6 +81,12 @@ class Bus:
             aid: rec for aid, rec in self.agents.items()
             if not (rec.get("state") in TERMINAL and rec.get("updated", 0) < cutoff)
         }
+        # re-arm the blocked re-announce for any agent restored still blocked, so
+        # a daemon restart mid-herd doesn't silence a stuck worker until its next
+        # hook (which a blocked agent won't fire until a human acts anyway)
+        for aid, rec in self.agents.items():
+            if rec.get("state") == "blocked":
+                self._schedule_reemit(aid)
 
     def _save(self):
         if not self.state_path:
@@ -108,12 +122,17 @@ class Bus:
         event = {"type": "agent.state_changed", **self.snapshot(agent_id)}
         self._fanout(event, agent_id, state)
         self._wake(agent_id, state, event)
+        if state == "blocked":
+            self._schedule_reemit(agent_id)  # keep a stuck agent visible to late waiters
+        else:
+            self._cancel_reemit(agent_id)
         return event
 
     def remove(self, agent_id):
         rec = self.agents.pop(agent_id, None)
         if rec is None:
             return None
+        self._cancel_reemit(agent_id)
         self._save()
         event = {"type": "agent.removed", "id": agent_id}
         self._fanout(event, agent_id, None)
@@ -137,6 +156,34 @@ class Bus:
             else:
                 remaining.append((predicate, fut))
         self.waiters = remaining
+
+    def _schedule_reemit(self, agent_id):
+        self._cancel_reemit(agent_id)
+        if BLOCKED_REEMIT <= 0:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no daemon loop (e.g. a direct in-process report); nothing to arm
+        self._reemit[agent_id] = loop.call_later(
+            BLOCKED_REEMIT, self._reemit_blocked, agent_id)
+
+    def _cancel_reemit(self, agent_id):
+        handle = self._reemit.pop(agent_id, None)
+        if handle is not None:
+            handle.cancel()
+
+    def _reemit_blocked(self, agent_id):
+        rec = self.agents.get(agent_id)
+        if not rec or rec.get("state") != "blocked":
+            self._reemit.pop(agent_id, None)
+            return
+        # re-fire the wake so a waiter that registered AFTER the block still sees
+        # it; deliberately not a _fanout, to keep `watch` a pure state-CHANGE
+        # stream (monitor re-polls on its own tick anyway)
+        event = {"type": "agent.state_changed", **self.snapshot(agent_id)}
+        self._wake(agent_id, "blocked", event)
+        self._schedule_reemit(agent_id)
 
 
 def _send(writer, obj):
@@ -224,12 +271,18 @@ async def _handle_wait(writer, bus, rid, params):
     def matches(agent_id):
         return agent_id in ids or (prefix is not None and agent_id.startswith(prefix))
 
+    def matched_now():
+        # every currently-matching agent already in a target state, so a herd
+        # wait can batch-collect them instead of re-issuing the wait per straggler
+        return [bus.snapshot(a) for a in bus.agents
+                if matches(a) and bus.agents[a]["state"] in states]
+
     if not params.get("edge"):
-        for agent_id in list(bus.agents):
-            if matches(agent_id) and bus.agents[agent_id]["state"] in states:
-                _send(writer, {"id": rid, "result": {
-                    "type": "waited", "already": True, **bus.snapshot(agent_id)}})
-                return
+        ready = matched_now()
+        if ready:
+            _send(writer, {"id": rid, "result": {
+                **ready[0], "type": "waited", "already": True, "matched": ready}})
+            return
 
     fut = asyncio.get_running_loop().create_future()
     entry = (lambda i, s: matches(i) and s in states, fut)
@@ -237,7 +290,8 @@ async def _handle_wait(writer, bus, rid, params):
     timeout = params.get("timeout_ms")
     try:
         event = await asyncio.wait_for(fut, timeout / 1000.0 if timeout else None)
-        _send(writer, {"id": rid, "result": {**event, "type": "waited", "already": False}})
+        _send(writer, {"id": rid, "result": {
+            **event, "type": "waited", "already": False, "matched": matched_now()}})
     except asyncio.TimeoutError:
         _send(writer, {"id": rid, "error": {"code": "timeout", "agents": ids,
                                             "prefix": prefix, "states": states}})
@@ -777,8 +831,8 @@ def cmd_hook(args):
             params["message"] = squash(data.get("prompt") or "")
         elif event in ("Notification", "PermissionRequest"):
             params["message"] = squash(data.get("message") or "awaiting approval")
-        elif event == "SessionStart":
-            params["message"] = ""
+        elif event in ("SessionStart", "Stop"):
+            params["message"] = ""  # a starting/finished turn shows no stale "doing" text
 
         if not ensure_daemon(args.socket):
             return 0
@@ -879,7 +933,8 @@ def cmd_approve(args):
         if edge:
             # answering a menu resumes the turn either way (approve or deny);
             # the next real hook event corrects this if the optimism is wrong
-            call(args.socket, "agent.report", {"id": args.id, "state": "working"}, timeout=1.0)
+            call(args.socket, "agent.report",
+                 {"id": args.id, "state": "working", "message": ""}, timeout=1.0)
     except OSError:
         # approve's core job (the keypress) already happened; don't fail after the side effect
         out = tmux("capture-pane", "-p", "-t", pane, "-S", f"-{args.lines}", check=True)

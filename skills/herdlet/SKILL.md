@@ -80,7 +80,9 @@ exit code 0 = state reached (`result.state` says which), 2 = timeout. always
 pass `--timeout`. after waking, `peek` to see what actually happened.
 
 to watch several agents at once, wait on all of them in one call; it wakes on
-whichever transitions first (`result.id` says which):
+whichever transitions first (`result.id` says which). `result.matched` lists
+EVERY agent already in a target state at wake time, so collect that whole
+batch and only re-wait for the stragglers, instead of one wait per agent:
 
 ```bash
 herdlet wait --id proj/dev,proj/tester --state done,blocked --timeout 550
@@ -96,6 +98,13 @@ waiting for the real next transition:
 ```bash
 herdlet wait --id proj/dev --state done,blocked --edge --timeout 550
 ```
+
+a `blocked` agent is re-announced to waiters periodically (every ~30s), so an
+`--edge` wait you START while an agent is already stuck no longer starves - it
+wakes on the next re-announce even without a fresh hook. you still won't get
+INSTANT notice of an already-stuck agent under `--edge`; when you just want to
+know who is stuck right now, use a plain `wait` or `list`, which return
+immediately (`matched` carries the whole set).
 
 to wait on terminal OUTPUT instead of agent state - a build finishing, a
 server logging "listening", a test summary - match a regex against the

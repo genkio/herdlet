@@ -421,6 +421,68 @@ class HerdletTest(unittest.TestCase):
             self.assertTrue(os.path.exists(
                 os.path.join(claude_dir, "settings.json.herdlet-bak")))
 
+    def test_hook_stop_clears_stale_message(self):
+        env = {"HERDLET_ID": "sm1"}
+        self.run_cli("hook", stdin=json.dumps(
+            {"hook_event_name": "Notification", "message": "needs permission"}),
+            env_extra=env)
+        rec = self.parse(self.run_cli("get", "--id", "sm1"))["result"]
+        self.assertEqual(rec["state"], "blocked")
+        self.assertEqual(rec["message"], "needs permission")
+        # Stop ends the turn: the stale "needs permission" must not ride into done
+        self.run_cli("hook", stdin=json.dumps({"hook_event_name": "Stop"}), env_extra=env)
+        rec = self.parse(self.run_cli("get", "--id", "sm1"))["result"]
+        self.assertEqual(rec["state"], "done")
+        self.assertIsNone(rec["message"])
+
+    def test_wait_matched_lists_all_ready(self):
+        # a herd wait returns every currently-matching agent, not just the first,
+        # so a master can batch-collect instead of re-issuing the wait per straggler
+        self.parse(self.run_cli("report", "--id", "mb/one", "--state", "done"))
+        self.parse(self.run_cli("report", "--id", "mb/two", "--state", "done"))
+        resp = self.parse(self.run_cli(
+            "wait", "--prefix", "mb/", "--state", "done", "--timeout", "2"))
+        self.assertTrue(resp["result"]["already"])
+        ids = sorted(a["id"] for a in resp["result"]["matched"])
+        self.assertEqual(ids, ["mb/one", "mb/two"])
+
+    def test_blocked_reemit_wakes_late_edge_waiter(self):
+        # a wait --edge that STARTS after an agent is already blocked ignores the
+        # stored state and would starve forever; the daemon's periodic re-emit is
+        # what wakes it. run a dedicated daemon with a fast re-emit to prove it.
+        with tempfile.TemporaryDirectory() as tmp:
+            sock = os.path.join(tmp, "re.sock")
+            env = dict(os.environ)
+            env.pop("TMUX_PANE", None)
+            env.pop("HERDLET_ID", None)
+            env["HERDLET_BLOCKED_REEMIT"] = "0.4"
+            daemon = subprocess.Popen(
+                [sys.executable, BIN, "--socket", sock, "serve"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+            try:
+                for _ in range(50):
+                    if os.path.exists(sock):
+                        break
+                    time.sleep(0.05)
+
+                def cli(*args):
+                    return subprocess.run(
+                        [sys.executable, BIN, "--socket", sock, *args],
+                        capture_output=True, text=True, env=env, timeout=15)
+
+                cli("report", "--id", "b1", "--state", "blocked")
+                start = time.time()
+                proc = cli("wait", "--id", "b1", "--state", "blocked",
+                           "--edge", "--timeout", "5")
+                elapsed = time.time() - start
+                self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+                resp = json.loads(proc.stdout)
+                self.assertFalse(resp["result"]["already"])  # woke on a re-emit, not already-path
+                self.assertLess(elapsed, 3)                  # ~0.4s re-emit, not the 5s timeout
+            finally:
+                daemon.terminate()
+                daemon.wait(timeout=5)
+
 
 def _load_module():
     import importlib.util

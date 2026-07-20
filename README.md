@@ -46,9 +46,9 @@ wiring? The snippets are below.
 
 There is no daemon to babysit: `hook`, `report` and `monitor` auto-start it
 on first use (`herdlet serve` runs it in the foreground if you prefer).
-After upgrading, restart it so new protocol features (any-of `wait`) are
-served: `pkill -f 'herdlet.*serve'`; agents re-register on their next hook
-event.
+After upgrading, restart it so new protocol features (any-of `wait`, the
+`blocked` re-announce, the `matched` batch) are served:
+`pkill -f 'herdlet.*serve'`; agents re-register on their next hook event.
 
 ## Quickstart
 
@@ -224,9 +224,15 @@ Newline-delimited JSON over `~/.herdlet.sock` (override with `--socket` or
 `{"id", "result"}` or `{"id", "error"}`.
 
 Methods: `ping`, `agent.report`, `agent.get`, `agent.list`, `agent.remove`,
-`wait` (`{id | ids | prefix, states, timeout_ms}`, wakes on the first
-matching agent), `subscribe` (`{id?, state?}`, connection then streams
+`wait` (`{id | ids | prefix, states, timeout_ms, edge?}`, wakes on the first
+matching agent; the result carries `matched`, every agent currently in a
+target state, so a herd wait can batch-collect instead of re-waiting per
+straggler), `subscribe` (`{id?, state?}`, connection then streams
 `agent.state_changed` / `agent.removed` events).
+
+A `blocked` agent is re-announced to waiters every `HERDLET_BLOCKED_REEMIT`
+seconds (default 30, 0 disables), so a `wait` - especially `--edge` - that
+started *after* the agent was already blocked still wakes instead of starving.
 
 Report merge semantics: absent/null fields preserve the previous value, empty
 string clears (merge keys: `message`, `agent`, `pane`, `cwd`, `session`).
