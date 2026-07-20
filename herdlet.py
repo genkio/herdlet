@@ -25,7 +25,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 DEFAULT_SOCK = os.environ.get("HERDLET_SOCKET", os.path.expanduser("~/.herdlet.sock"))
 LOG_PATH = os.path.expanduser("~/.herdlet.log")
@@ -48,6 +48,13 @@ TERMINAL_TTL = 86400.0
 # starving. Waiters only, not subscribers (`watch` stays a pure change stream;
 # `monitor` already re-polls on its own tick). 0 disables.
 BLOCKED_REEMIT = float(os.environ.get("HERDLET_BLOCKED_REEMIT", "30"))
+# Registry GC: a record untouched for MAX_AGE is dropped regardless of state.
+# A days-dead pane never reports a terminal state, so the terminal-only TTL
+# above never catches it; the age cap does, and a still-live agent simply
+# re-registers on its next hook. The daemon sweeps every PRUNE_INTERVAL seconds
+# and also prunes on load. 0 disables the cap / the sweep respectively.
+MAX_AGE = float(os.environ.get("HERDLET_MAX_AGE", str(3 * 86400)))
+PRUNE_INTERVAL = float(os.environ.get("HERDLET_PRUNE_INTERVAL", "3600"))
 RESUME = {
     "claude": "claude --resume {session}",
     "codex": "codex resume {session}",
@@ -74,12 +81,13 @@ class Bus:
                 self.agents = data["agents"]
         except (OSError, json.JSONDecodeError):
             pass  # best-effort: a bad snapshot just means an empty registry
-        # Terminal records persist across restarts (so resume survives one), but
-        # drop the long-dead ones so the registry doesn't grow without bound.
-        cutoff = time.time() - TERMINAL_TTL
+        # GC on load: drop cleanly-finished records after TERMINAL_TTL and any
+        # record untouched past MAX_AGE (see _prunable), so a restart clears the
+        # days-dead panes a terminal-only TTL would keep forever.
+        now = time.time()
         self.agents = {
             aid: rec for aid, rec in self.agents.items()
-            if not (rec.get("state") in TERMINAL and rec.get("updated", 0) < cutoff)
+            if not self._prunable(rec, now)
         }
         # re-arm the blocked re-announce for any agent restored still blocked, so
         # a daemon restart mid-herd doesn't silence a stuck worker until its next
@@ -184,6 +192,34 @@ class Bus:
         event = {"type": "agent.state_changed", **self.snapshot(agent_id)}
         self._wake(agent_id, "blocked", event)
         self._schedule_reemit(agent_id)
+
+    def _prunable(self, rec, now):
+        age = now - rec.get("updated", 0)
+        if rec.get("state") in TERMINAL and age > TERMINAL_TTL:
+            return True
+        return MAX_AGE > 0 and age > MAX_AGE
+
+    def start_prune_sweeps(self):
+        # periodic registry GC so a long-running daemon self-cleans without a
+        # restart; kicked off once from _serve, then it reschedules itself
+        if PRUNE_INTERVAL <= 0:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.call_later(PRUNE_INTERVAL, self._prune_sweep)
+
+    def _prune_sweep(self):
+        now = time.time()
+        drop = [aid for aid, rec in self.agents.items() if self._prunable(rec, now)]
+        for aid in drop:
+            self._cancel_reemit(aid)
+            self.agents.pop(aid, None)
+            self._fanout({"type": "agent.removed", "id": aid}, aid, None)
+        if drop:
+            self._save()
+        self.start_prune_sweeps()
 
 
 def _send(writer, obj):
@@ -329,6 +365,7 @@ async def _handle_subscribe(reader, writer, bus, rid, params):
 
 async def _serve(sock_path):
     bus = Bus(state_path=sock_path + ".state")
+    bus.start_prune_sweeps()
     server = await asyncio.start_unix_server(
         lambda r, w: _handle_client(r, w, bus), path=sock_path)
     os.chmod(sock_path, 0o600)

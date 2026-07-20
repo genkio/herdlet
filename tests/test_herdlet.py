@@ -483,6 +483,37 @@ class HerdletTest(unittest.TestCase):
                 daemon.terminate()
                 daemon.wait(timeout=5)
 
+    def test_periodic_sweep_prunes_over_max_age(self):
+        # a long-running daemon GCs records that age past the cap, no restart needed
+        with tempfile.TemporaryDirectory() as tmp:
+            sock = os.path.join(tmp, "sw.sock")
+            env = dict(os.environ)
+            env.pop("TMUX_PANE", None)
+            env.pop("HERDLET_ID", None)
+            env["HERDLET_MAX_AGE"] = "1"
+            env["HERDLET_PRUNE_INTERVAL"] = "0.4"
+            daemon = subprocess.Popen(
+                [sys.executable, BIN, "--socket", sock, "serve"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+            try:
+                for _ in range(50):
+                    if os.path.exists(sock):
+                        break
+                    time.sleep(0.05)
+
+                def cli(*args):
+                    return subprocess.run(
+                        [sys.executable, BIN, "--socket", sock, *args],
+                        capture_output=True, text=True, env=env, timeout=15)
+
+                r = cli("report", "--id", "sweepme", "--state", "idle")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                time.sleep(2.0)  # ages past the 1s cap; the 0.4s sweep drops it
+                self.assertEqual(cli("get", "--id", "sweepme").returncode, 1)
+            finally:
+                daemon.terminate()
+                daemon.wait(timeout=5)
+
 
 def _load_module():
     import importlib.util
@@ -557,6 +588,34 @@ class LoadPruneTest(unittest.TestCase):
             self.assertNotIn("old/ended", bus.agents)     # ancient + terminal -> pruned
             self.assertIn("recent/ended", bus.agents)      # terminal but fresh -> kept
             self.assertIn("live/working", bus.agents)      # non-terminal -> kept regardless of age
+
+    def test_load_prunes_any_record_over_max_age(self):
+        os.environ["HERDLET_MAX_AGE"] = "100"
+        try:
+            h = _load_module()
+            self.assertEqual(h.MAX_AGE, 100.0)
+            with tempfile.TemporaryDirectory() as d:
+                path = os.path.join(d, "s.state")
+                now = time.time()
+                with open(path, "w") as fh:
+                    json.dump({"agents": {
+                        "stale/working": {"state": "working", "updated": now - 500,
+                                          "session": "x", "pane": "%1", "message": "",
+                                          "agent": "c", "cwd": "/tmp"},
+                        "stale/blocked": {"state": "blocked", "updated": now - 500,
+                                          "session": "y", "pane": "%2", "message": "",
+                                          "agent": "c", "cwd": "/tmp"},
+                        "fresh/working": {"state": "working", "updated": now - 5,
+                                          "session": "z", "pane": "%3", "message": "",
+                                          "agent": "c", "cwd": "/tmp"},
+                    }}, fh)
+                bus = h.Bus(state_path=path)
+                # over the age cap -> pruned even though not terminal
+                self.assertNotIn("stale/working", bus.agents)
+                self.assertNotIn("stale/blocked", bus.agents)
+                self.assertIn("fresh/working", bus.agents)
+        finally:
+            del os.environ["HERDLET_MAX_AGE"]
 
 
 if __name__ == "__main__":

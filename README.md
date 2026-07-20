@@ -100,7 +100,11 @@ id, which is what powers `herdlet resume` (types `claude --resume <id>` /
 `codex resume <id>` / `opencode --session <id>` into the pane after a crash or
 usage-limit kill). A finished session becomes `ended` rather than vanishing, so
 you can still collect its output and resume it; `herdlet remove` (or `ack`)
-clears it, and long-dead terminal records are pruned automatically.
+clears it. The registry self-cleans: terminal records are dropped 24h after
+finishing, and ANY record untouched for `HERDLET_MAX_AGE` (default 3d, 0
+disables) is dropped whatever its state - the days-dead panes a terminal-only
+TTL never catches. A still-live agent just re-registers on its next hook; the
+daemon sweeps hourly and also on load.
 
 opencode has no shell-hook config, so `herdlet setup` installs a small plugin
 (`~/.config/opencode/plugins/herdlet.js`) that reports the same states from

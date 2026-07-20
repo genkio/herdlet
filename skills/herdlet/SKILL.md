@@ -387,7 +387,9 @@ herdlet watch --state blocked # who just got stuck
 - after `send`, sleep ~2s before `wait`: the target flips to `working` via its
   own hook, which takes a moment. waiting instantly can match its stale `done`.
 - ids are live registry entries; re-read `herdlet list` rather than assuming
-  an old id still exists.
+  an old id still exists. the registry self-cleans - finished records drop
+  after 24h, and anything untouched for ~3 days is dropped regardless of state
+  (`HERDLET_MAX_AGE`), re-registering only when the agent next acts.
 - `send` is terminal input: no control sequences. multi-line text is fine
   (delivered as a bracketed paste).
 - waiting only on `done` can hang forever if the target hits a permission
