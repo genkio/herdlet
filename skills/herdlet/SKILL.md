@@ -252,6 +252,18 @@ tell it to `cd X && ...` for another repo, that prefix defeats prefix-based
 permission allowlists and adds an extra approval warning per command. tell it
 to use `git -C <path>` (or the tool's own `--cwd`/`-C` flag) instead.
 
+**keep the worker's pane readable.** if the worker runs a full-screen TUI on
+the terminal's ALTERNATE screen buffer (Claude Code's `tui: fullscreen`, like
+vim/htop), its transcript lives in that buffer, NOT the pane's native
+scrollback - so `peek`, `approve`, and `wait --match` (which read
+`tmux capture-pane -S`) get stale pre-launch scrollback plus at most the
+current screenful, never the conversation history, and you can silently misread
+or miss what a worker is showing. launch workers in the inline/classic
+renderer: for Claude Code prepend `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` (or
+set `"tui": "default"` in the worker cwd's `.claude/settings.json`, which
+overrides your user setting). state DETECTION is unaffected either way - it is
+hook-driven, not scraped - this only restores your ability to READ the pane.
+
 ## act as a master orchestrator
 
 if the user asks you to manage a project (or several), you are the master:

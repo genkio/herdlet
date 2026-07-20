@@ -214,6 +214,12 @@ herdlet send --id worker "now fix the failing test"
 
 The waiter is woken by a push from the daemon, not a polling loop.
 
+If a worker runs a full-screen TUI (Claude Code's `tui: fullscreen`), its
+transcript lives in the terminal's alternate screen buffer, which `peek` /
+`wait --match` (via `tmux capture-pane`) can't read - launch such workers in
+the classic renderer (`CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1`) so their panes
+stay scrapeable. State detection is hook-driven and works regardless.
+
 The skill bakes in the economics lessons of running herds for real: pick a
 model per role by tier, never by inheriting the default (a worker launched
 bare takes your priciest MAIN model - a herd of those burns tokens fast),
