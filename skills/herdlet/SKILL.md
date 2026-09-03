@@ -174,8 +174,8 @@ in a shell that keeps the pane alive and emits its own done-marker AFTER the CLI
 returns:
 
 ```bash
-tmux split-window -d -P -F '#{pane_id}' "bash -c '\
-  HERDLET_ID=proj/worker $LAUNCH --model <cheap-id> \
+tmux split-window -d -P -F '#{pane_id}' -t "$TMUX_PANE" "bash -c '\
+  HERDLET_ID=proj/worker $LAUNCH -n \"proj/worker: <purpose>\" --model <cheap-id> \
     --allowedTools Read Edit \"Bash(pnpm *)\" \
     -p \"read plans/worker.md and do it\" | tee /tmp/worker.out; \
   echo exit=\${PIPESTATUS[0]} > /tmp/worker.done; sleep 3600'"
@@ -201,9 +201,15 @@ three rules baked into that wrapper, each a real failure it prevents:
 interactive workers don't have the exit race - the TUI keeps the pane open:
 
 ```bash
-tmux split-window -d -P -F '#{pane_id}' \
-  "HERDLET_ID=worker $LAUNCH --model <cheap-id>"
+tmux split-window -d -P -F '#{pane_id}' -t "$TMUX_PANE" \
+  "HERDLET_ID=worker $LAUNCH -n 'worker: <purpose>' --model <cheap-id>"
 ```
+
+**always pass `-t "$TMUX_PANE"`.** without a target, `split-window` splits
+the window the human is LOOKING AT right now, not yours - if they switched to
+another project's window while you worked, your worker lands in that window
+and they lose track of it. `-t "$TMUX_PANE"` splits your own pane, wherever
+the human's focus is.
 
 after they register you drive them with `send` / `wait` / `peek` cycles.
 

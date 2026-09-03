@@ -206,7 +206,7 @@ npx skills add genkio/herdlet        # Claude Code, Codex, Cursor, ...
 
 ```bash
 # spawn a worker in a new pane, wait for it, read its result
-tmux split-window -d -P -F '#{pane_id}' "HERDLET_ID=worker $LAUNCH --model <cheap-id> -p 'run the test suite'"
+tmux split-window -d -P -F '#{pane_id}' -t "$TMUX_PANE" "HERDLET_ID=worker $LAUNCH -n 'worker: test suite' --model <cheap-id> -p 'run the test suite'"
 herdlet wait --id worker --state done,blocked --timeout 900
 herdlet peek --id worker --lines 40
 herdlet send --id worker "now fix the failing test"
