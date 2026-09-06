@@ -380,7 +380,7 @@ class HerdletTest(unittest.TestCase):
             with open(os.path.join(home, ".claude", "settings.json")) as fh:
                 cfg = json.load(fh)
             for event in ("SessionStart", "SessionEnd", "UserPromptSubmit",
-                          "PostToolUse", "Notification", "Stop"):
+                          "PostToolUse", "Notification", "PreCompact", "Stop"):
                 commands = [h["command"] for g in cfg["hooks"][event] for h in g["hooks"]]
                 self.assertTrue(any("herdlet hook" in c for c in commands), event)
             matchers = [g.get("matcher") for g in cfg["hooks"]["Notification"]]
@@ -509,6 +509,28 @@ class HerdletTest(unittest.TestCase):
         proc = self.run_cli("wait", "--id", "ghost", "--state", "done", "--timeout", "0.3")
         self.assertEqual(proc.returncode, 2)
         self.assertEqual(json.loads(proc.stdout)["error"]["code"], "timeout")
+
+    def test_hook_precompact_counts_and_keeps_state(self):
+        env = {"HERDLET_ID": "pc1"}
+        self.run_cli("hook", stdin=json.dumps(
+            {"hook_event_name": "UserPromptSubmit", "prompt": "big job"}), env_extra=env)
+        self.run_cli("hook", stdin=json.dumps({"hook_event_name": "PreCompact"}),
+                     env_extra=env)
+        rec = self.parse(self.run_cli("get", "--id", "pc1"))["result"]
+        self.assertEqual(rec["state"], "working")   # the turn goes on
+        self.assertEqual(rec["compacts"], 1)
+        self.assertEqual(rec["message"], "big job")  # the prompt survives
+        self.run_cli("hook", stdin=json.dumps({"hook_event_name": "PreCompact"}),
+                     env_extra=env)
+        rec = self.parse(self.run_cli("get", "--id", "pc1"))["result"]
+        self.assertEqual(rec["compacts"], 2)
+        self.assertEqual(rec["message"], "big job")
+
+    def test_hook_precompact_for_an_unknown_id_registers_nothing(self):
+        # a compaction says nothing about state, so it must not create a record
+        self.run_cli("hook", stdin=json.dumps({"hook_event_name": "PreCompact"}),
+                     env_extra={"HERDLET_ID": "pc-ghost"})
+        self.assertEqual(self.run_cli("get", "--id", "pc-ghost").returncode, 1)
 
     def test_hook_records_transcript_path(self):
         self.run_cli("hook", stdin=json.dumps(
@@ -751,6 +773,24 @@ class LoadPruneTest(unittest.TestCase):
             del os.environ["HERDLET_MAX_AGE"]
 
 
+
+
+class SnapshotTest(unittest.TestCase):
+    def test_a_record_without_compacts_still_answers_the_question(self):
+        h = _load_module()
+        bus = h.Bus()
+        bus.agents["legacy"] = {"state": "idle", "pane": "%1", "message": None,
+                                "agent": "claude", "session": None, "cwd": None,
+                                "updated": time.time()}
+        self.assertEqual(bus.snapshot("legacy")["compacts"], 0)
+
+    def test_a_real_count_is_not_overwritten_by_the_default(self):
+        h = _load_module()
+        bus = h.Bus()
+        bus.report("a", {"state": "working"})
+        bus.report("a", {"compact": True})
+        bus.report("a", {"compact": True})
+        self.assertEqual(bus.snapshot("a")["compacts"], 2)
 
 
 class LimitSweepTest(unittest.TestCase):

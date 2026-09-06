@@ -137,7 +137,9 @@ class Bus:
 
     def snapshot(self, agent_id):
         rec = self.agents.get(agent_id)
-        return {"id": agent_id, **rec} if rec else None
+        # compacts defaulted here so a record written by an older daemon still
+        # answers the question `get` is asked
+        return {"id": agent_id, "compacts": 0, **rec} if rec else None
 
     def report(self, agent_id, params):
         rec = self.agents.setdefault(agent_id, {
@@ -153,6 +155,8 @@ class Bus:
                 rec[key] = None  # explicit clear; absent/null means preserve
             elif value is not None:
                 rec[key] = value
+        if params.get("compact"):
+            rec["compacts"] = int(rec.get("compacts") or 0) + 1
         rec["updated"] = round(time.time(), 3)
         self._save()
         event = {"type": "agent.state_changed", **self.snapshot(agent_id)}
@@ -826,7 +830,7 @@ CODEX_HOOK_CMD = ("command -v herdlet >/dev/null 2>&1 && "
                   "herdlet hook --agent codex --event {event} || true")
 NOTIFY_MATCHER = "permission_prompt|elicitation_dialog"
 CLAUDE_EVENTS = ("SessionStart", "SessionEnd", "UserPromptSubmit",
-                 "PostToolUse", "Notification", "Stop")
+                 "PostToolUse", "Notification", "PreCompact", "Stop")
 CODEX_EVENTS = ("UserPromptSubmit", "PreToolUse", "PermissionRequest", "Stop")
 
 
@@ -976,6 +980,20 @@ def cmd_hook(args):
                 return 0
             call(args.socket, "agent.report", params, timeout=1.0)
             return 0
+
+        if event == "PreCompact":
+            if not ensure_daemon(args.socket):
+                return 0
+            # a compaction alone says nothing about state, so an id with no
+            # record yet must not be registered as `unknown`
+            if "result" not in call(args.socket, "agent.get",
+                                    {"id": agent_id}, timeout=1.0):
+                return 0
+            call(args.socket, "agent.report",
+                 {"id": agent_id, "agent": args.agent, "compact": True,
+                  "pane": os.environ.get("TMUX_PANE")}, timeout=1.0)
+            return 0
+
         state = HOOK_STATES.get(event)
         if state is None:
             return 0
