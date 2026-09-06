@@ -773,6 +773,55 @@ class LoadPruneTest(unittest.TestCase):
             del os.environ["HERDLET_MAX_AGE"]
 
 
+class VersionSkewTest(unittest.TestCase):
+    """A daemon left over from an older install serves an older protocol."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.sock = os.path.join(self.tmp.name, "v.sock")
+        old = os.path.join(self.tmp.name, "old.py")
+        with open(BIN) as src, open(old, "w") as dst:
+            dst.write(src.read().replace('__version__ = "', '__version__ = "0.0.0-', 1))
+        self.daemon = subprocess.Popen(
+            [sys.executable, old, "--socket", self.sock, "serve"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(self._stop)
+        for _ in range(50):
+            if os.path.exists(self.sock):
+                break
+            time.sleep(0.05)
+        else:
+            raise RuntimeError("daemon did not start")
+
+    def _stop(self):
+        self.daemon.terminate()
+        self.daemon.wait(timeout=5)
+
+    def cli(self, *args, stdin=None):
+        env = dict(os.environ)
+        env.pop("TMUX_PANE", None)
+        env.pop("HERDLET_ID", None)
+        return subprocess.run([sys.executable, BIN, "--socket", self.sock, *args],
+                              capture_output=True, text=True, input=stdin,
+                              env=env, timeout=15)
+
+    def test_every_read_command_warns(self):
+        self.cli("report", "--id", "v1", "--state", "idle")
+        for cmd in (("list",), ("get", "--id", "v1"), ("ping",),
+                    ("wait", "--id", "v1", "--state", "done", "--timeout", "0.2"),
+                    ("ack", "--id", "v1")):
+            proc = self.cli(*cmd)
+            self.assertIn("daemon is 0.0.0-", proc.stderr, cmd)
+            self.assertIn("pkill -f 'herdlet.*serve'", proc.stderr, cmd)
+
+    def test_hook_stays_silent(self):
+        proc = self.cli("hook", stdin=json.dumps(
+            {"hook_event_name": "UserPromptSubmit", "prompt": "go",
+             "session_id": "abc"}))
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stderr, "")
+        self.assertEqual(proc.stdout, "")
 
 
 class SnapshotTest(unittest.TestCase):

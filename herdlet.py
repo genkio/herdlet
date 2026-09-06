@@ -516,6 +516,19 @@ def call_or_die(sock_path, method, params, timeout=5.0):
         die(f"herdlet daemon is not running on {sock_path} (start it with: herdlet serve)")
 
 
+def warn_version_skew(sock_path):
+    # a daemon from a previous install serves the old protocol: no limit sweep,
+    # no transcript/model/effort merge keys, no compacts counter
+    try:
+        version = call(sock_path, "ping", {}, timeout=1.0)["result"]["version"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return
+    if version != __version__:
+        print(f"herdlet: daemon is {version}, client is {__version__}; "
+              f"restart it: pkill -f 'herdlet.*serve' then any herdlet command",
+              file=sys.stderr)
+
+
 def ensure_daemon(sock_path):
     if daemon_running(sock_path):
         return True
@@ -1637,6 +1650,10 @@ def main():
     p.set_defaults(fn=cmd_setup)
 
     args = parser.parse_args()
+    # not for serve (it IS the daemon) and not for hook (which must never print,
+    # and would pay for a ping on every tool call)
+    if args.cmd not in ("serve", "hook") and daemon_running(args.socket):
+        warn_version_skew(args.socket)
     try:
         sys.exit(args.fn(args) or 0)
     except KeyboardInterrupt:
