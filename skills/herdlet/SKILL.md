@@ -23,8 +23,11 @@ this means you can:
 
 ## concepts
 
-**states**: `idle`, `working`, `blocked`, `done`, `ended` (custom strings
-allowed). `blocked` means the agent is waiting for a human approval; `done`
+**states**: `idle`, `working`, `spawning`, `blocked`, `limited`, `done`,
+`ended` (custom strings allowed). `blocked` means the agent is waiting for a
+human approval; `limited` means the daemon spotted a usage-limit banner in its
+pane, so it is parked until the limit resets; `spawning` means `herdlet spawn`
+registered it but its first hook has not fired yet; `done`
 means its turn finished; `ended` means the whole session exited - the record is
 KEPT (with its session ref) so you can still see it and `resume` it. states
 update automatically via your harness's hooks (`herdlet setup` wires Claude
@@ -63,21 +66,41 @@ flagged stale: its hooks keep the record fresh, and only a record that stops
 updating trips the check. `ended` is a clean session exit. all three keep the
 record, so see "resume a dead worker".
 
+`limited` means the daemon read a usage-limit banner at the bottom of that
+agent's pane. no hook fires when a worker hits its limit, so without this the
+record would sit on `working` and every waiter would run to timeout. the worker
+is alive and its context is intact: do NOT respawn it. wait for the reset, then
+`send` it a short nudge to continue; if its process did die, `list` shows
+`stale` instead and you `resume`. the next real hook event clears `limited` on
+its own. it is a screen read, so it can be wrong: a pane that PRINTS that
+wording (you `peek`ed a limited worker into your own pane) is flagged too. when
+`limited` surprises you, `peek` before acting on it.
+
 ## wait for another agent
 
 ```bash
 herdlet wait --id builder --state done --timeout 600
 ```
 
-always include `blocked` in the states unless you specifically want to sleep
-through approval prompts: a blocked agent will not finish until a human acts.
+always include `blocked` and `limited` in the states unless you specifically
+want to sleep through them: a blocked agent will not finish until a human acts,
+and a limited one will not finish until its usage limit resets.
 
 ```bash
-herdlet wait --id builder --state done,blocked --timeout 600
+herdlet wait --id builder --state done,blocked,limited --timeout 600
 ```
 
 exit code 0 = state reached (`result.state` says which), 2 = timeout. always
 pass `--timeout`. after waking, `peek` to see what actually happened.
+
+if your harness reports a background command's non-zero exit as a FAILURE
+(Claude Code's background Bash does), add `--timeout-ok`: the timeout comes back
+as a normal result (`result.type` = `timeout`, exit 0) instead of an error, and
+you decide whether to wait again. without the flag a plain timeout looks like a
+crashed command. `approve --wait --timeout-ok` takes the flag too, where it only
+changes the exit code (0 instead of 2); approve prints a state line, not JSON.
+neither form hides a hung daemon, which still fails. leave the flag OFF in the
+chunked loop below, which keys on exit 2.
 
 to watch several agents at once, wait on all of them in one call; it wakes on
 whichever transitions first (`result.id` says which). `result.matched` lists
@@ -85,8 +108,8 @@ EVERY agent already in a target state at wake time, so collect that whole
 batch and only re-wait for the stragglers, instead of one wait per agent:
 
 ```bash
-herdlet wait --id proj/dev,proj/tester --state done,blocked --timeout 550
-herdlet wait --prefix proj/ --state blocked --timeout 550   # anyone stuck?
+herdlet wait --id proj/dev,proj/tester --state done,blocked,limited --timeout 550
+herdlet wait --prefix proj/ --state blocked,limited --timeout 550   # anyone stuck?
 ```
 
 `--edge` ignores whatever state is already recorded and wakes only on a
@@ -135,31 +158,85 @@ done
 
 ```bash
 herdlet peek --id builder --lines 60
+herdlet peek --id builder --transcript             # its last answer, verbatim
+herdlet peek --id builder --transcript --lines 3   # its last 3 answers, oldest first
 ```
 
-this is that pane's visible scrollback tail, exactly what a human would see.
-pass `--join` to unwrap soft-wrapped lines - better when grepping logs or
-transcripts.
+plain `peek` is that pane's visible scrollback tail, exactly what a human would
+see. pass `--join` to unwrap soft-wrapped lines - better when grepping logs.
+
+`--transcript` reads the worker's OWN transcript file instead of the screen and
+prints the last N assistant messages (text blocks only; tool calls and thinking
+are dropped). prefer it whenever you want what the worker SAID: a pane capture
+is lossy - it wraps, it scrolls, and a full-screen TUI hides its history
+entirely - while the transcript is the real text. it needs a `transcript` field
+in the record, which Claude Code's hooks provide; for an agent without one it
+says `no transcript recorded for <id>; use plain peek`. use plain `peek` for
+what is on SCREEN right now: a permission menu, a banner, a running command.
 
 ## send instructions to another agent
 
 ```bash
 herdlet send --id builder "run the full test suite and report failures"
+herdlet send --id builder --file plans/round2.md     # long or multi-line message
+git diff | herdlet send --id builder --file -        # or from stdin
 ```
 
 the text is typed into that agent's terminal and submitted with Enter, as if
 its human had typed it. if the target agent is mid-turn, the message queues
 like normal user input. use `--no-enter` to type without submitting.
-multi-line text is delivered as one bracketed paste, so embedded newlines
-read as text instead of submitting early.
+
+anything multi-line or over 200 characters is delivered as one bracketed paste,
+so embedded newlines read as text instead of submitting early and a long message
+cannot be cut in half by the Enter that follows it. pass a long brief with
+`--file` rather than as a shell argument: no quoting to get wrong, and no
+argv-length ceiling. still prefer a brief FILE on disk plus a one-line
+"read X and do it" for anything really big - it costs the worker one Read
+instead of a wall of pasted text.
 
 ## spawn a worker agent
 
-spawn a worker with the **same launch command you were started under**, not a
-bare vendor binary. that command carries your model routing, endpoint/auth env,
-and per-role config; a bare `claude`/`codex` in a fresh pane inherits none of it
-and may hit the wrong endpoint or an unconfigured model. call it `$LAUNCH` below
-and substitute your own:
+for a Claude Code worker, use `herdlet spawn`. one command does the whole
+launch: it builds the pane, pins the model and effort, mutes the human's
+per-turn notifications, keeps the pane readable, registers the worker BEFORE its
+first hook, waits for it to come up, and hands it its brief.
+
+```bash
+herdlet spawn --id proj/dev --model sonnet --effort medium --brief plans/dev.md
+# spawned proj/dev in %7 (sonnet/medium)
+```
+
+- `--id`, `--model` and `--effort` are required. never let a worker inherit the
+  default model (see the tier table below); `--effort` is the same lever for
+  output tokens, so keep mechanical roles on `low`.
+- `--brief PATH` is the normal way to task a worker: the title defaults to the
+  brief's first heading, and once the worker is up it is sent
+  `Read <brief> and do it.` write the brief to a file first.
+- `--title "<purpose>"` names the session when there is no brief, so the worker
+  is findable in the resume picker later.
+- other flags: `--cwd DIR`, `--vertical`, `--permission-mode <mode>`
+  (default `auto`), `--env K=V` (repeatable), `--ready-timeout SECONDS`
+  (default 30), `--json`.
+- exit 0 = the pane is up. either the worker registered and got its brief, or it
+  had not reported within `--ready-timeout` but its pane is alive. in the second
+  case **the brief was NOT sent** (the warning says so, and `--json` carries
+  `brief_sent`): `peek` the pane, clear whatever it is sitting on - a first run
+  in a new directory can be on a trust prompt - then `send` the brief yourself.
+  exit 1 = the pane is already gone, so the launch command itself failed; check
+  the model and effort you passed.
+- the record exists from t=0 in state `spawning`, so the worker is addressable
+  by NAME immediately, including for the trust prompt above. no pane-id-only
+  window any more.
+- if the window has no room to split, spawn opens a new window in your session
+  instead and says so.
+
+`spawn` is claude-only. for any other agent, build the pane by hand as below.
+
+spawn a non-claude worker with the **same launch command you were started
+under**, not a bare vendor binary. that command carries your model routing,
+endpoint/auth env, and per-role config; a bare `codex` in a fresh pane inherits
+none of it and may hit the wrong endpoint or an unconfigured model. call it
+`$LAUNCH` below and substitute your own:
 
 | harness | `$LAUNCH` |
 |---|---|
@@ -209,7 +286,7 @@ tmux split-window -d -P -F '#{pane_id}' -t "$TMUX_PANE" \
 the window the human is LOOKING AT right now, not yours - if they switched to
 another project's window while you worked, your worker lands in that window
 and they lose track of it. `-t "$TMUX_PANE"` splits your own pane, wherever
-the human's focus is.
+the human's focus is. (`herdlet spawn` does this for you.)
 
 after they register you drive them with `send` / `wait` / `peek` cycles.
 
@@ -247,11 +324,13 @@ command still prompts.) other harnesses have their own allowlist/sandbox
 flags - check `$LAUNCH --help`. answering menus by hand (see "unblock a
 worker") is the exception path, not the loop.
 
-**pre-registration blind spot.** keep the pane id `split-window -P` printed
-you; until the worker's first hook event it has no registry entry at all, so
-it is only addressable by that pane id. a first run in a new directory can
-block on a trust/onboarding prompt BEFORE any hook exists - `peek` / `approve`
-that worker by pane id (`%N`), not by the name you gave it.
+**pre-registration blind spot (hand-built panes only).** keep the pane id
+`split-window -P` printed you; until the worker's first hook event it has no
+registry entry at all, so it is only addressable by that pane id. a first run in
+a new directory can block on a trust/onboarding prompt BEFORE any hook exists -
+`peek` / `approve` that worker by pane id (`%N`), not by the name you gave it.
+`herdlet spawn` has no such gap: it registers the worker as `spawning` the
+moment the pane exists.
 
 **brief your workers on cwd.** commands run from the worker's own cwd; if you
 tell it to `cd X && ...` for another repo, that prefix defeats prefix-based
@@ -278,21 +357,21 @@ window with one pane per role, then relay work between them:
 
 ```bash
 tmux new-window -t personal -n herdlet -c ~/code/herdlet
-tmux split-window -h -t personal:herdlet
-tmux send-keys -t personal:herdlet.0 "HERDLET_ID=personal/herdlet/dev CC_IMESSAGE_SKIP=1 $LAUNCH --model <mid-id>" Enter
-tmux send-keys -t personal:herdlet.1 "HERDLET_ID=personal/herdlet/tester CC_IMESSAGE_SKIP=1 $LAUNCH --model <cheap-id>" Enter
-herdlet wait --id personal/herdlet/dev --state idle --timeout 30   # registered?
+herdlet spawn --id personal/herdlet/dev    --model <mid-id>   --effort medium --brief plans/dev.md
+herdlet spawn --id personal/herdlet/tester --model <cheap-id> --effort low    --brief plans/tester.md
 ```
 
-spawn workers with the mute env vars of any per-turn notification hooks the
-user runs (like `CC_IMESSAGE_SKIP=1` above), so only masters page the human.
+`spawn` already sets `CC_IMESSAGE_SKIP=1` (so only masters page the human) and
+`CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` (so the pane stays readable), and waits
+for each worker to register. when you build a pane by hand, set those yourself,
+plus the mute env vars of any other per-turn notification hooks the user runs.
 the reverse also exists: `HERDLET_SKIP=1` makes herdlet ignore a nested
 agent run entirely; set it when a hook or script of yours shells out to a
 nested agent (`claude -p`, `codex exec`) from inside an agent's pane
 environment.
 
-then loop: `send` a role its task, one long `wait --state done,blocked` on
-all roles at once (`--id a,b` or `--prefix proj/`), `peek` for the outcome,
+then loop: `send` a role its task, one long `wait --state done,blocked,limited`
+on all roles at once (`--id a,b` or `--prefix proj/`), `peek` for the outcome,
 pass results to the next role, report to the user.
 relay `peek` summaries, not whole transcripts, to keep your own context small.
 after collecting a worker's result, `herdlet ack --id <worker>` clears it from
@@ -307,6 +386,15 @@ ran in an isolated git worktree, snapshot everything it produced in one shot -
 - BEFORE you `git checkout`/`clean`/reset that worktree for the next worker. a
 hand-rolled loop over `git status --porcelain` will trip over untracked
 directories and a premature `clean` can delete a deliverable you never captured.
+
+**watch `compacts` and hand over before it climbs.** `herdlet get` shows
+`compacts`, how many times an agent has compacted its context (its state and
+message are untouched by a compaction). a worker on its second compaction has
+already lost detail and is paying to re-read what it forgot; that is the signal to end
+its phase, have it write a handover file, and start the next phase with a fresh
+worker rather than nursing it along. your own compactions count too: keep the
+herd's state in `plans/*.md`, not in your context, so a compaction costs you
+nothing.
 
 **keep workers short-lived.** a worker that lives for hours drags an
 ever-growing context into every one of its turns; the tail of a fat session
@@ -408,10 +496,15 @@ herdlet watch --state blocked # who just got stuck
   an old id still exists. the registry self-cleans - finished records drop
   after 24h, and anything untouched for ~3 days is dropped regardless of state
   (`HERDLET_MAX_AGE`), re-registering only when the agent next acts.
-- `send` is terminal input: no control sequences. multi-line text is fine
-  (delivered as a bracketed paste).
+- `send` is terminal input: no control sequences. multi-line and long text is
+  fine (delivered as a bracketed paste); use `--file` for anything big.
 - waiting only on `done` can hang forever if the target hits a permission
-  prompt; include `blocked`.
+  prompt or a usage limit; include `blocked,limited`.
+- `limited` is scraped from the pane, not pushed by a hook, so it lands within
+  ~30s (a worker that just reported waits one more tick) and only for workers
+  whose pane is readable (see the renderer note in "keep the worker's pane
+  readable"). it is a hint that the worker is parked, never a reason to
+  respawn it.
 - a denied permission interrupts the turn without firing any hook, so
   `blocked` can linger until the target's next event. an old `blocked` with a
   quiet pane means a human already acted; `peek` before trusting it. if the

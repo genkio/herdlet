@@ -44,32 +44,38 @@ Add `--allow-tmux` if agents should also spawn panes unprompted. It is
 idempotent and leaves everything else in your settings alone. Prefer manual
 wiring? The snippets are below.
 
-There is no daemon to babysit: `hook`, `report` and `monitor` auto-start it
-on first use (`herdlet serve` runs it in the foreground if you prefer).
-After upgrading, restart it so new protocol features (any-of `wait`, the
-`blocked` re-announce, the `matched` batch) are served:
-`pkill -f 'herdlet.*serve'`; agents re-register on their next hook event.
+There is no daemon to babysit: `hook`, `report`, `spawn` and `monitor`
+auto-start it on first use (`herdlet serve` runs it in the foreground if you
+prefer). After upgrading, restart it so the 0.7.0 daemon-side features are
+served: the `limited` sweep, the `transcript` / `model` / `effort` merge keys,
+and the `compacts` counter. Run `pkill -f 'herdlet.*serve'` and then any herdlet
+command; agents re-register on their next hook event. Every command except
+`hook` warns on stderr when it finds a daemon older than itself.
 
 ## Quickstart
 
 ```bash
 herdlet report --id builder --state working --message "npm test"
 herdlet list
-# ID       STATE    AGE  AGENT  PANE  WHERE       MESSAGE
-# builder  working  2s   -      %5    dots:1 zsh  npm test
+# ID       STATE    AGE  AGENT  MODEL  PANE  WHERE       MESSAGE
+# builder  working  2s   -             %5    dots:1 zsh  npm test
 
-herdlet wait --id builder --state done,blocked --timeout 600   # push-woken, no polling
+herdlet wait --id builder --state done,blocked,limited --timeout 600  # push-woken, no polling
 herdlet wait --id builder,tester --state done,blocked --timeout 600  # any-of: wakes on whichever first
 herdlet wait --prefix myproject/ --state blocked --timeout 600       # anyone in the project stuck?
 herdlet wait --id builder --state blocked --edge --timeout 600  # ignore stale state, wake on a fresh report only
+herdlet wait --id builder --state done --timeout 600 --timeout-ok  # timeout is a result, exit 0
 herdlet watch                                    # stream every state change as JSON lines
 herdlet list --here                              # scope to the current tmux session
 herdlet list --prefix myproject/                 # scope to one project's agents
 
 herdlet wait --id builder --match 'tests? passed|ERROR' --timeout 600  # wait on pane OUTPUT (plain commands too)
 
-herdlet send --id builder "run the tests again"  # types into builder's pane + Enter (multi-line = one bracketed paste)
+herdlet spawn --id myproject/dev --model sonnet --effort medium --brief plans/dev.md  # new pane, registered from t=0
+herdlet send --id builder "run the tests again"  # types into builder's pane + Enter
+herdlet send --id builder --file plans/next.md   # long or multi-line message from a file ('-' = stdin)
 herdlet peek --id builder --lines 40             # read builder's recent output (--join unwraps soft wraps)
+herdlet peek --id builder --transcript --lines 2 # read builder's own transcript instead of the pane
 herdlet approve --id builder                     # answer a permission menu (option 1), echo the pane
 herdlet approve --id builder --wait              # answer, mark working, edge-wait for the next transition, show the pane
 herdlet ack --id builder                         # collected the result: done -> idle (list = inbox)
@@ -77,8 +83,23 @@ herdlet resume --id builder                      # agent died? type its native r
 herdlet monitor                                  # live TUI (made for a tmux popup)
 ```
 
+`wait` exits 2 on timeout, which is what the chunked-wait loop below keys on.
+Harnesses that surface a background command's exit code as a failure (Claude
+Code's background Bash among them) should pass `--timeout-ok`: the timeout comes
+back as `result.type: "timeout"` with exit 0. `approve --wait --timeout-ok`
+takes the flag too, where it only changes the exit code (0 instead of 2);
+`approve` prints a state line, not JSON. Neither form hides a hung daemon,
+which still fails.
+
 Agent ids resolve from `--id`, then `$HERDLET_ID`, then `$TMUX_PANE`. Name an
 agent by launching it with an env var: `HERDLET_ID=builder claude`.
+
+`send` types short text with `tmux send-keys`, and routes anything multi-line or
+over 200 characters through a bracketed paste instead, so the receiving TUI gets
+one atomic block and cannot submit half of it. Note that a pane sitting at a
+plain shell (not an agent TUI) is in canonical tty mode, where the kernel drops
+any single input line over 1023 characters whichever way it is delivered; agent
+TUIs read in raw mode and are not affected.
 
 ## Automatic state from Claude Code / Codex hooks
 
@@ -91,6 +112,7 @@ never blocks, and always exits 0, so it is safe in any hook chain.
 | SessionStart | idle |
 | UserPromptSubmit, PreToolUse, PostToolUse | working |
 | Notification (permission), PermissionRequest | blocked |
+| PreCompact | state and message unchanged, `compacts` +1 (see `herdlet get`) |
 | Stop | done |
 | SessionEnd | ended (record kept, with its session ref) |
 
@@ -110,12 +132,51 @@ opencode has no shell-hook config, so `herdlet setup` installs a small plugin
 (`~/.config/opencode/plugins/herdlet.js`) that reports the same states from
 opencode's event stream.
 
+Hooks also record each agent's transcript path, which is what
+`herdlet peek --id <agent> --transcript` reads: the last N assistant messages
+straight out of the agent's own jsonl, text blocks only, instead of whatever
+happens to be on screen. It is exact where a pane capture is lossy (wrapping,
+a full-screen TUI, a scrolled-off answer). Agents without a transcript path
+(codex, opencode, records from before 0.7) keep plain `peek`.
+
 `list` and `monitor` cross-check the registry against reality: an agent
 whose pane is gone shows `gone`; one whose pane fell back to a bare shell
 *and whose record has gone quiet* shows `stale` (the process died without a
 hook firing - resume it). A live worker whose pane merely shows a shell (a
 wrapper script, `-p` piped to `tee`, a shell tool call) is not flagged, because
 its hooks keep the record fresh.
+
+## The `limited` state
+
+An agent parked on its harness's usage-limit banner fires no hook, so its
+record would say `working` forever and every waiter on it would run to timeout.
+The daemon closes that hole: every `HERDLET_LIMIT_INTERVAL` seconds (default 30)
+it reads the last 8 non-blank lines of the visible pane of each `working` / `spawning`
+agent and, on a match against `HERDLET_LIMIT_PATTERN`, reports state `limited`
+with message `usage limit banner in pane`. That is a normal report, so waiters
+wake at once. (`blocked` is not swept: it is already a wake signal.)
+
+- the default pattern matches Claude Code's own banner wording (`Usage limit
+  reached ...`, `You've hit your session limit ...`, `You're out of usage
+  credits`, `Your org is out of usage ...`). Override it for another harness.
+- deliberately excluded: `Approaching your 5-hour usage limit ...`, which is a
+  warning while the agent keeps working, and the fast-mode limits
+  (`You've hit your fast limit`, `Fast limit reached and temporarily
+  disabled`), where fast mode simply falls back to the normal one.
+- only the bottom of the *visible* pane counts, because that is where Claude
+  Code draws the banner. An old banner scrolled up into history does not count,
+  and a record is only flipped if it has also been quiet for a full sweep
+  interval, so a worker that auto-resumed is not dragged back to `limited`.
+- `limited` is live, not terminal: the record is never pruned as finished, and
+  the next real hook event overwrites it. It can still go `stale` if its pane
+  falls back to a shell, which means the process died and needs `resume`.
+- put it in your waits: `--state done,blocked,limited`.
+- `HERDLET_LIMIT_SWEEP=0` turns the sweep off. Detection is a pane read, so a
+  worker running a full-screen TUI on the alternate screen is invisible to it
+  (see the renderer note below), and the daemon only sees panes on the tmux
+  server it inherited `$TMUX` from.
+- residual false positive: a pane that prints the banner wording itself (you
+  `peek` a limited worker into your own pane) is flagged until its next hook.
 
 `herdlet setup` wires all of this for you; the snippets below are the manual
 reference. Claude Code `settings.json` (same pattern for Codex `hooks.json`,
@@ -129,6 +190,7 @@ with `--agent codex`):
     "PostToolUse":      [{ "hooks": [{ "type": "command", "command": "command -v herdlet >/dev/null && herdlet hook || true" }] }],
     "Notification":     [{ "matcher": "permission_prompt|elicitation_dialog",
                            "hooks": [{ "type": "command", "command": "command -v herdlet >/dev/null && herdlet hook || true" }] }],
+    "PreCompact":       [{ "hooks": [{ "type": "command", "command": "command -v herdlet >/dev/null && herdlet hook || true" }] }],
     "Stop":             [{ "hooks": [{ "type": "command", "command": "command -v herdlet >/dev/null && herdlet hook || true" }] }],
     "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "command -v herdlet >/dev/null && herdlet hook || true" }] }]
   }
@@ -173,18 +235,20 @@ A master's turn looks like: you say "let's work on herdlet: spin up a dev and
 a tester, requirement is ...", and it runs
 
 ```bash
-tmux new-window -t personal -n herdlet -c ~/code/herdlet
-tmux split-window -h -t personal:herdlet
-tmux send-keys -t personal:herdlet.0 "HERDLET_ID=personal/herdlet/dev $LAUNCH --model <mid-id>" Enter
-tmux send-keys -t personal:herdlet.1 "HERDLET_ID=personal/herdlet/tester $LAUNCH --model <cheap-id>" Enter
+herdlet spawn --id personal/herdlet/dev    --model sonnet --effort medium --brief plans/dev.md
+herdlet spawn --id personal/herdlet/tester --model haiku  --effort low    --brief plans/tester.md
 ```
 
-(`$LAUNCH` = however you launch your agent - `claude`, `codex`, or a wrapper
-that sets a custom endpoint/model; swap `<mid-id>`/`<cheap-id>` for model ids
-valid in your setup. a worker is a top-level session, so it takes your MAIN
-model unless you downgrade it explicitly - that is the cost lever.)
+`spawn` splits the caller's own pane, builds the launch line (mute env vars,
+classic renderer, `HERDLET_ID`, a session name, the model and effort you asked
+for), registers the worker as `spawning` before its first hook fires, waits for
+that hook, then hands it its brief. `--model` and `--effort` are required on
+purpose: a worker is a top-level session, so anything you do not pin explicitly
+runs on your MAIN (priciest) model, and that is the whole cost lever. Other
+agents (codex, opencode, a wrapper that sets a custom endpoint) still launch by
+hand with `tmux split-window`; see the skill for that recipe.
 
-then drives the pair with `send` / `wait --state done,blocked` / `peek`,
+then drives the pair with `send` / `wait --state done,blocked,limited` / `peek`,
 relaying between roles and reporting back to you. Hours later, "now genkia"
 just means a new window; the herdlet window keeps existing and its agents show
 `idle` in the monitor. Two masters never interfere: each spawns only into its
@@ -206,13 +270,20 @@ npx skills add genkio/herdlet        # Claude Code, Codex, Cursor, ...
 
 ```bash
 # spawn a worker in a new pane, wait for it, read its result
-tmux split-window -d -P -F '#{pane_id}' -t "$TMUX_PANE" "HERDLET_ID=worker $LAUNCH -n 'worker: test suite' --model <cheap-id> -p 'run the test suite'"
-herdlet wait --id worker --state done,blocked --timeout 900
-herdlet peek --id worker --lines 40
-herdlet send --id worker "now fix the failing test"
+herdlet spawn --id proj/worker --model haiku --effort low --brief plans/worker.md
+herdlet wait --id proj/worker --state done,blocked,limited --timeout 900
+herdlet peek --id proj/worker --transcript --lines 2
+herdlet send --id proj/worker "now fix the failing test"
 ```
 
 The waiter is woken by a push from the daemon, not a polling loop.
+
+For a non-Claude agent, or a one-shot `-p` wrapper, build the pane yourself and
+let the worker's hooks register it:
+
+```bash
+tmux split-window -d -P -F '#{pane_id}' -t "$TMUX_PANE" "HERDLET_ID=proj/worker $LAUNCH -n 'proj/worker: test suite' --model <cheap-id> -p 'run the test suite'"
+```
 
 If a worker runs a full-screen TUI (Claude Code's `tui: fullscreen`), its
 transcript lives in the terminal's alternate screen buffer, which `peek` /
@@ -245,9 +316,14 @@ seconds (default 30, 0 disables), so a `wait` - especially `--edge` - that
 started *after* the agent was already blocked still wakes instead of starving.
 
 Report merge semantics: absent/null fields preserve the previous value, empty
-string clears (merge keys: `message`, `agent`, `pane`, `cwd`, `session`).
-Tool-use hooks report `message: null`, which is why the prompt survives as
-the message for the whole turn.
+string clears (merge keys: `message`, `agent`, `pane`, `cwd`, `session`,
+`transcript`, `model`, `effort`). Tool-use hooks report `message: null`, which
+is why the prompt survives as the message for the whole turn. `compacts` is a
+daemon-side counter, bumped by `{"compact": true}` reports.
+
+Environment: `HERDLET_SOCKET`, `HERDLET_ID`, `HERDLET_SKIP`,
+`HERDLET_BLOCKED_REEMIT`, `HERDLET_MAX_AGE`, `HERDLET_PRUNE_INTERVAL`,
+`HERDLET_LIMIT_SWEEP`, `HERDLET_LIMIT_INTERVAL`, `HERDLET_LIMIT_PATTERN`.
 
 ## Development
 
