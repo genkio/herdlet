@@ -546,11 +546,17 @@ def squash(text, limit=120):
     return " ".join(str(text).split())[:limit]
 
 
-def tmux(*args, check=False, input=None):
+def tmux_run(*args, input=None, timeout=5):
     try:
-        out = subprocess.run(("tmux",) + args, capture_output=True, text=True,
-                             timeout=5, input=input)
+        return subprocess.run(("tmux",) + args, capture_output=True, text=True,
+                              timeout=timeout, input=input)
     except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+
+
+def tmux(*args, check=False, input=None):
+    out = tmux_run(*args, input=input)
+    if out is None:
         if check:
             die("tmux not available")
         return None
@@ -682,6 +688,11 @@ def filter_agents(agents, session=None, here=False, prefix=None):
     return agents
 
 
+def model_cell(rec):
+    parts = [rec.get("model"), rec.get("effort")]
+    return "/".join(p for p in parts if p)
+
+
 def cmd_list(args):
     resp = call_or_die(args.socket, "agent.list", {})
     agents = annotate(resp.get("result", {}).get("agents", []), pane_map())
@@ -692,13 +703,14 @@ def cmd_list(args):
     if not agents:
         print("no agents registered")
         return
-    rows = [("ID", "STATE", "AGE", "AGENT", "PANE", "WHERE", "MESSAGE")]
+    rows = [("ID", "STATE", "AGE", "AGENT", "MODEL", "PANE", "WHERE", "MESSAGE")]
     for rec in agents:
         rows.append((rec["id"], rec["state"], rec["age"], rec.get("agent") or "-",
-                     rec.get("pane") or "-", rec["where"], rec.get("message") or ""))
-    widths = [max(len(row[i]) for row in rows) for i in range(6)]
+                     model_cell(rec), rec.get("pane") or "-", rec["where"],
+                     rec.get("message") or ""))
+    widths = [max(len(row[i]) for row in rows) for i in range(7)]
     for row in rows:
-        print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row[:6])) + "  " + row[6])
+        print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row[:7])) + "  " + row[7])
 
 
 def timeout_as_result(resp):
@@ -1084,6 +1096,130 @@ def cmd_peek(args):
     print(out.rstrip("\n"))
 
 
+SPAWN_ENV = ("CC_IMESSAGE_SKIP=1", "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1")
+
+
+def brief_title(path):
+    """First markdown heading of a brief, which is what the worker is for."""
+    try:
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                match = re.match(r"\s*#+\s+(.+?)\s*$", line)
+                if match:
+                    return squash(match.group(1))
+    except OSError:
+        pass
+    return None
+
+
+def spawn_line(agent_id, model, effort, title, permission_mode,
+               env=(), program="claude", program_args=()):
+    parts = list(SPAWN_ENV) + [f"HERDLET_ID={shlex.quote(agent_id)}"]
+    for pair in env:
+        key, sep, value = pair.partition("=")
+        if not sep or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            die(f"invalid --env pair: {pair}")
+        parts.append(f"{key}={shlex.quote(value)}")
+    if program == "claude":
+        parts += ["claude",
+                  "-n", shlex.quote(f"{agent_id}: {title}"),
+                  "--model", shlex.quote(model),
+                  "--effort", shlex.quote(effort),
+                  "--permission-mode", shlex.quote(permission_mode)]
+    else:
+        parts += [shlex.quote(program)] + [shlex.quote(a) for a in program_args]
+    return " ".join(parts)
+
+
+def spawn_split_argv(pane, cwd, line, vertical=False):
+    return ("split-window", "-d", "-v" if vertical else "-h", "-P", "-F",
+            "#{pane_id}", "-t", pane, "-c", cwd, line)
+
+
+def spawn_window_argv(session, agent_id, cwd, line):
+    return ("new-window", "-d", "-P", "-F", "#{pane_id}", "-t", session,
+            "-n", agent_id, "-c", cwd, line)
+
+
+def cmd_spawn(args):
+    if args.agent != "claude":
+        die("spawn supports claude only; launch other agents by hand (see README)")
+    caller = os.environ.get("TMUX_PANE")
+    if not caller:
+        die("spawn must run inside tmux")
+    cwd = os.path.abspath(args.cwd or os.getcwd())
+    brief = os.path.abspath(args.brief) if args.brief else None
+    title = args.title or (brief_title(brief) if brief else None) or "worker"
+    line = spawn_line(args.id, args.model, args.effort, title, args.permission_mode,
+                      args.env or (), args.program, args.program_args or ())
+
+    fallback = None
+    out = tmux_run(*spawn_split_argv(caller, cwd, line, args.vertical), timeout=15)
+    if out is None:
+        die("tmux not available")
+    if out.returncode != 0:
+        if "no space" not in out.stderr.lower():
+            die(f"tmux split-window: {out.stderr.strip()}")
+        session = (tmux("display-message", "-p", "-t", caller,
+                        "#{session_name}", check=True) or "").strip()
+        fallback = f"window full, opened a new window in session {session}"
+        out = tmux_run(*spawn_window_argv(session, args.id, cwd, line), timeout=15)
+        if out is None or out.returncode != 0:
+            die(f"tmux new-window: {(out.stderr if out else '').strip()}")
+    pane = out.stdout.strip()
+
+    # register before the worker's first hook: until then it has no record at
+    # all, so a trust/onboarding prompt is only addressable by raw pane id
+    ensure_daemon(args.socket)
+    params = {"id": args.id, "agent": "claude", "pane": pane, "cwd": cwd,
+              "model": args.model, "effort": args.effort,
+              "message": f"spawning: {title}"}
+    if not spawn_ready(args.socket, args.id, pane):
+        params["state"] = "spawning"  # else a hook beat us here; don't undo it
+    call_or_die(args.socket, "agent.report", params)
+
+    if args.ready_timeout > 0:
+        call_or_die(args.socket, "wait", {
+            "id": args.id, "states": ["idle", "working"],
+            "timeout_ms": int(args.ready_timeout * 1000),
+        }, timeout=args.ready_timeout + 5)
+    ready = spawn_ready(args.socket, args.id, pane)
+    if ready and brief:
+        send_text(pane, f"Read {brief} and do it.")
+    # tmux answers a missing -t target with success and an empty line, so the
+    # only reliable liveness check is getting the pane id back
+    gone = not ready and (tmux("display-message", "-p", "-t", pane,
+                               "#{pane_id}") or "").strip() != pane
+
+    if args.json:
+        print(json.dumps({"result": {
+            "type": "spawned", "id": args.id, "pane": pane, "model": args.model,
+            "effort": args.effort, "title": title, "cwd": cwd, "ready": ready,
+            "brief_sent": bool(ready and brief), "note": fallback}}, indent=2))
+    else:
+        if fallback:
+            print(fallback)
+        print(f"spawned {args.id} in {pane} ({args.model}/{args.effort})")
+    if gone:
+        print(f"herdlet: pane {pane} is gone: the launch command exited; "
+              f"check the model/effort flags", file=sys.stderr)
+        return 1
+    if not ready:
+        brief_note = ("; the brief was not sent, send it once the prompt is "
+                      "cleared" if brief else "")
+        print(f"warning: {args.id} did not report in {args.ready_timeout}s; "
+              f"pane {pane} is alive, peek/approve it by pane id{brief_note}",
+              file=sys.stderr)
+    return 0
+
+
+def spawn_ready(sock_path, agent_id, pane):
+    # the pane check is what stops a leftover idle record under the same id (an
+    # acked worker, a record still inside MAX_AGE) from passing as this worker
+    rec = call_or_die(sock_path, "agent.get", {"id": agent_id}).get("result") or {}
+    return rec.get("state") in ("idle", "working") and rec.get("pane") == pane
+
+
 def cmd_ack(args):
     ids = [s.strip() for s in args.id.split(",") if s.strip()]
     missing = 0
@@ -1422,6 +1558,26 @@ def main():
                    help="read the agent's own transcript jsonl instead of the "
                         "pane: the last --lines assistant messages, verbatim")
     p.set_defaults(fn=cmd_peek)
+
+    p = sub.add_parser("spawn", help="launch a Claude Code worker in a new pane and register it")
+    p.add_argument("--id", required=True, help="agent id, e.g. myproject/dev")
+    p.add_argument("--model", required=True, help="model id (never inherit the default)")
+    p.add_argument("--effort", required=True,
+                   choices=("low", "medium", "high", "xhigh"))
+    p.add_argument("--agent", default="claude", help="agent kind (only claude for now)")
+    p.add_argument("--title", help="one-line purpose (default: the brief's first heading)")
+    p.add_argument("--brief", help="brief file; the worker is told to read it and do it")
+    p.add_argument("--cwd", help="worker's working directory (default: yours)")
+    p.add_argument("--permission-mode", default="auto")
+    p.add_argument("--env", action="append", metavar="K=V",
+                   help="extra env var for the worker (repeatable)")
+    p.add_argument("--vertical", action="store_true", help="split vertically")
+    p.add_argument("--ready-timeout", type=float, default=30,
+                   help="seconds to wait for the worker's first hook (default: 30)")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--program", default="claude", help=argparse.SUPPRESS)
+    p.add_argument("--program-args", action="append", help=argparse.SUPPRESS)
+    p.set_defaults(fn=cmd_spawn)
 
     p = sub.add_parser("ack", help="mark collected results as seen: done -> idle")
     p.add_argument("--id", required=True, help="agent id(s), comma-separated")

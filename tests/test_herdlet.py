@@ -583,11 +583,38 @@ class HerdletTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("unknown agent 'no-such-agent'", proc.stderr)
 
+    def test_spawn_rejects_bad_env_pairs(self):
+        for bad in ("NOEQUALS", "2BAD=x", "has-dash=x", "=x"):
+            proc = self.run_cli("spawn", "--id", "x/y", "--model", "opus",
+                                "--effort", "high", "--env", bad,
+                                env_extra={"TMUX_PANE": "%1"})
+            self.assertEqual(proc.returncode, 1, bad)
+            self.assertIn(f"invalid --env pair: {bad}", proc.stderr)
+
+
     def test_send_file_must_exist(self):
         proc = self.run_cli("send", "--id", "%1", "--file",
                             "/tmp/herdlet-no-such-file.txt")
         self.assertEqual(proc.returncode, 1)
         self.assertIn("cannot read", proc.stderr)
+
+    def test_spawn_rejects_other_agents(self):
+        proc = self.run_cli("spawn", "--id", "x/y", "--model", "opus",
+                            "--effort", "high", "--agent", "codex")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("spawn supports claude only", proc.stderr)
+
+    def test_spawn_outside_tmux_dies(self):
+        proc = self.run_cli("spawn", "--id", "x/y", "--model", "opus",
+                            "--effort", "high")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("spawn must run inside tmux", proc.stderr)
+
+    def test_list_shows_model_column(self):
+        self.run_cli("report", "--id", "mc1", "--state", "idle")
+        proc = self.run_cli("list")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("MODEL", proc.stdout.splitlines()[0])
 
     def test_periodic_sweep_prunes_over_max_age(self):
         # a long-running daemon GCs records that age past the cap, no restart needed
@@ -975,6 +1002,68 @@ class SendRoutingTest(unittest.TestCase):
         self.assertEqual(self.verbs(), ["send-keys"])
 
 
+class SpawnLineTest(unittest.TestCase):
+    def setUp(self):
+        self.h = _load_module()
+
+    def test_house_launch_line(self):
+        line = self.h.spawn_line("proj/dev", "opus", "high", "ship the thing", "auto")
+        self.assertEqual(line, (
+            "CC_IMESSAGE_SKIP=1 CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 "
+            "HERDLET_ID=proj/dev claude -n 'proj/dev: ship the thing' "
+            "--model opus --effort high --permission-mode auto"))
+
+    def test_values_are_shell_quoted(self):
+        line = self.h.spawn_line("proj/dev", "opus", "high",
+                                 "don't; rm -rf /", "auto",
+                                 env=["API_KEY=a b'c"])
+        import shlex
+        words = shlex.split(line)
+        # the whole nasty title is ONE word, so the shell never sees `rm -rf /`
+        self.assertIn("proj/dev: don't; rm -rf /", words)
+        self.assertIn("API_KEY=a b'c", words)
+
+    def test_extra_env_comes_before_the_program(self):
+        line = self.h.spawn_line("p/d", "sonnet", "low", "t", "auto",
+                                 env=["FOO=bar", "BAZ=qux"])
+        self.assertLess(line.index("FOO=bar"), line.index("claude"))
+        self.assertLess(line.index("BAZ=qux"), line.index("claude"))
+
+    def test_stub_program_replaces_the_claude_flags(self):
+        line = self.h.spawn_line("p/d", "sonnet", "low", "t", "auto",
+                                 program="sleep", program_args=["300"])
+        self.assertTrue(line.endswith("sleep 300"))
+        self.assertNotIn("--model", line)
+        self.assertIn("HERDLET_ID=p/d", line)
+
+    def test_split_argv(self):
+        self.assertEqual(
+            self.h.spawn_split_argv("%3", "/tmp", "LINE"),
+            ("split-window", "-d", "-h", "-P", "-F", "#{pane_id}",
+             "-t", "%3", "-c", "/tmp", "LINE"))
+        self.assertIn("-v", self.h.spawn_split_argv("%3", "/tmp", "LINE", True))
+
+    def test_new_window_fallback_argv(self):
+        self.assertEqual(
+            self.h.spawn_window_argv("work", "proj/dev", "/tmp", "LINE"),
+            ("new-window", "-d", "-P", "-F", "#{pane_id}", "-t", "work",
+             "-n", "proj/dev", "-c", "/tmp", "LINE"))
+
+    def test_title_comes_from_the_brief_heading(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "b.md")
+            with open(path, "w") as fh:
+                fh.write("\n\n#  Rewrite the   parser  \n\nsome text\n")
+            self.assertEqual(self.h.brief_title(path), "Rewrite the parser")
+            self.assertIsNone(self.h.brief_title(os.path.join(d, "missing.md")))
+
+    def test_model_cell(self):
+        self.assertEqual(self.h.model_cell({"model": "opus", "effort": "high"}),
+                         "opus/high")
+        self.assertEqual(self.h.model_cell({"model": "opus"}), "opus")
+        self.assertEqual(self.h.model_cell({}), "")
+
+
 class _Args:
     def __init__(self, **kw):
         self.__dict__.update(kw)
@@ -1005,6 +1094,200 @@ class _DaemonCase(unittest.TestCase):
 
     def record(self, agent_id):
         return self.h.call(self.sock, "agent.get", {"id": agent_id}).get("result")
+
+
+class SpawnCommandTest(_DaemonCase):
+    """cmd_spawn end to end with tmux and send_text faked out."""
+
+    def setUp(self):
+        super().setUp()
+        self.h.os.environ["TMUX_PANE"] = "%0"
+        self.addCleanup(self.h.os.environ.pop, "TMUX_PANE", None)
+        self.runs = []
+        self.sent = []
+        self.h.send_text = lambda pane, text, no_enter=False: self.sent.append((pane, text))
+        self.panes = {"%0", "%7"}
+        self.h.tmux = self._tmux
+        self.h.tmux_run = self._tmux_run
+
+    def _tmux(self, *args, check=False, input=None):
+        out = self._tmux_run(*args, input=input)
+        return out.stdout if out.returncode == 0 else None
+
+    def _tmux_run(self, *args, input=None, timeout=5):
+        self.runs.append(args)
+        if args[0] == "split-window":
+            return self.split_result()
+        if args[0] == "new-window":
+            return subprocess.CompletedProcess(args, 0, "%9\n", "")
+        if args[0] == "display-message" and "#{session_name}" in args:
+            return subprocess.CompletedProcess(args, 0, "work\n", "")
+        if args[0] == "display-message" and "#{pane_id}" in args:
+            pane = args[args.index("-t") + 1]
+            # tmux answers a missing target with success and an empty line
+            return subprocess.CompletedProcess(
+                args, 0, (pane + "\n") if pane in self.panes else "\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    def split_result(self):
+        return subprocess.CompletedProcess((), 0, "%7\n", "")
+
+    def args(self, **kw):
+        base = dict(socket=self.sock, id="proj/dev", model="opus", effort="high",
+                    agent="claude", title=None, brief=None, cwd=None,
+                    permission_mode="auto", env=None, vertical=False,
+                    ready_timeout=0.5, json=False, program="claude",
+                    program_args=None)
+        base.update(kw)
+        return _Args(**base)
+
+    def spawn(self, **kw):
+        """cmd_spawn with its output captured: (code, stdout, stderr)."""
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = self.h.cmd_spawn(self.args(**kw))
+        return code, out.getvalue(), err.getvalue()
+
+    def ready_in(self, delay, state="working", pane="%7"):
+        threading.Timer(delay, lambda: self.h.call(
+            self.sock, "agent.report",
+            {"id": "proj/dev", "state": state, "pane": pane})).start()
+
+    def test_registers_before_the_first_hook(self):
+        code, out, err = self.spawn()
+        rec = self.record("proj/dev")
+        self.assertEqual(rec["state"], "spawning")
+        self.assertEqual((rec["pane"], rec["model"], rec["effort"]),
+                         ("%7", "opus", "high"))
+        self.assertEqual(rec["message"], "spawning: worker")
+        self.assertEqual(out.strip(), "spawned proj/dev in %7 (opus/high)")
+        self.assertEqual(code, 0)   # not ready is not a failure
+
+    def test_ready_worker_gets_its_brief_with_an_absolute_path(self):
+        brief = os.path.join(self.tmp.name, "b.md")
+        with open(brief, "w") as fh:
+            fh.write("# Do the thing\n")
+        self.ready_in(0.15)
+        code, out, err = self.spawn(brief=os.path.relpath(brief),
+                                    cwd="/tmp", ready_timeout=3)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.sent, [("%7", f"Read {brief} and do it.")])
+        self.assertEqual(self.record("proj/dev")["cwd"], "/tmp")
+        self.assertEqual(err, "")
+
+    def test_title_and_state_come_from_the_brief_and_survive(self):
+        brief = os.path.join(self.tmp.name, "b.md")
+        with open(brief, "w") as fh:
+            fh.write("# Do the thing\n")
+        self.spawn(brief=brief)
+        self.assertEqual(self.record("proj/dev")["message"], "spawning: Do the thing")
+
+    def test_a_hook_that_lands_first_is_not_overwritten(self):
+        self.h.call(self.sock, "agent.report",
+                    {"id": "proj/dev", "state": "working", "pane": "%7",
+                     "message": "already going"})
+        code, out, err = self.spawn()
+        rec = self.record("proj/dev")
+        self.assertEqual(rec["state"], "working")   # not pushed back to spawning
+        self.assertEqual(rec["model"], "opus")      # but the new fields land
+        self.assertEqual(code, 0)
+
+    def test_a_stale_record_on_another_pane_does_not_count_as_ready(self):
+        # `ack` turns a finished worker into `idle`, and idle survives MAX_AGE:
+        # re-spawning that id must not read the leftover as a live worker and
+        # fire the brief into a pane where the agent has not booted
+        brief = os.path.join(self.tmp.name, "b.md")
+        with open(brief, "w") as fh:
+            fh.write("# Do the thing\n")
+        self.h.call(self.sock, "agent.report",
+                    {"id": "proj/dev", "state": "idle", "pane": "%2",
+                     "message": "last run"})
+        code, out, err = self.spawn(brief=brief)
+        rec = self.record("proj/dev")
+        self.assertEqual(rec["state"], "spawning")   # overwritten, not trusted
+        self.assertEqual(rec["pane"], "%7")
+        self.assertEqual(self.sent, [])              # brief withheld
+        self.assertIn("the brief was not sent", err)
+        self.assertEqual(code, 0)
+
+    def test_no_space_falls_back_to_a_new_window(self):
+        self.split_result = lambda: subprocess.CompletedProcess(
+            (), 1, "", "no space for new pane")
+        self.panes.add("%9")
+        code, out, err = self.spawn()
+        self.assertIn("new-window", [r[0] for r in self.runs])
+        self.assertEqual(self.record("proj/dev")["pane"], "%9")
+        self.assertIn("window full, opened a new window in session work", out)
+        self.assertIn("spawned proj/dev in %9 (opus/high)", out)
+        self.assertEqual(code, 0)
+
+    def test_timeout_with_a_live_pane_is_not_a_failure(self):
+        code, out, err = self.spawn()
+        self.assertIn("warning: proj/dev did not report in 0.5s; "
+                      "pane %7 is alive, peek/approve it by pane id", err)
+        self.assertNotIn("the brief was not sent", err)  # no brief was given
+        self.assertEqual(code, 0)
+
+    def test_timeout_with_a_brief_says_the_brief_was_not_sent(self):
+        brief = os.path.join(self.tmp.name, "b.md")
+        with open(brief, "w") as fh:
+            fh.write("# Do the thing\n")
+        code, out, err = self.spawn(brief=brief)
+        self.assertIn("; the brief was not sent, send it once the prompt is "
+                      "cleared", err)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(code, 0)
+
+    def test_timeout_with_a_dead_pane_is_a_failure(self):
+        self.panes.discard("%7")
+        code, out, err = self.spawn()
+        self.assertIn("herdlet: pane %7 is gone: the launch command exited; "
+                      "check the model/effort flags", err)
+        self.assertEqual(code, 1)
+
+    def test_ready_worker_never_checks_the_pane(self):
+        self.ready_in(0.15, state="idle")
+        code, out, err = self.spawn(ready_timeout=3)
+        self.assertEqual(code, 0)
+        self.assertNotIn("display-message",
+                         [r[0] for r in self.runs if "#{pane_id}" in r])
+
+    def test_zero_ready_timeout_skips_the_wait(self):
+        # timeout_ms 0 means "no timeout" to the daemon, so the wait must not
+        # be issued at all
+        code, out, err = self.spawn(ready_timeout=0)
+        self.assertEqual(self.record("proj/dev")["state"], "spawning")
+        self.assertIn("did not report in 0s", err)
+        self.assertEqual(code, 0)
+
+    def test_zero_ready_timeout_still_sees_a_worker_that_is_already_up(self):
+        self.h.call(self.sock, "agent.report",
+                    {"id": "proj/dev", "state": "working", "pane": "%7"})
+        code, out, err = self.spawn(ready_timeout=0)
+        self.assertEqual(err, "")
+        self.assertEqual(code, 0)
+
+    def test_json_payload(self):
+        brief = os.path.join(self.tmp.name, "b.md")
+        with open(brief, "w") as fh:
+            fh.write("# Do the thing\n")
+        self.ready_in(0.15)
+        code, out, err = self.spawn(brief=brief, json=True, ready_timeout=3)
+        payload = json.loads(out)["result"]
+        self.assertEqual(payload, {
+            "type": "spawned", "id": "proj/dev", "pane": "%7", "model": "opus",
+            "effort": "high", "title": "Do the thing", "cwd": os.getcwd(),
+            "ready": True, "brief_sent": True, "note": None})
+        self.assertEqual(code, 0)
+
+    def test_json_payload_reports_a_withheld_brief(self):
+        brief = os.path.join(self.tmp.name, "b.md")
+        with open(brief, "w") as fh:
+            fh.write("# Do the thing\n")
+        code, out, err = self.spawn(brief=brief, json=True)
+        payload = json.loads(out)["result"]
+        self.assertFalse(payload["ready"])
+        self.assertFalse(payload["brief_sent"])
 
 
 class ApproveTimeoutTest(_DaemonCase):
