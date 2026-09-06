@@ -510,6 +510,63 @@ class HerdletTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertEqual(json.loads(proc.stdout)["error"]["code"], "timeout")
 
+    def test_hook_records_transcript_path(self):
+        self.run_cli("hook", stdin=json.dumps(
+            {"hook_event_name": "UserPromptSubmit", "prompt": "go",
+             "transcript_path": "/tmp/does-not-matter.jsonl"}),
+            env_extra={"HERDLET_ID": "tr1"})
+        rec = self.parse(self.run_cli("get", "--id", "tr1"))["result"]
+        self.assertEqual(rec["transcript"], "/tmp/does-not-matter.jsonl")
+
+    def test_peek_transcript_prints_assistant_text(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "t.jsonl")
+            with open(path, "w") as fh:
+                for stamp, blocks in (
+                    ("2026-09-06T10:00:00.000Z",
+                     [{"type": "text", "text": "first answer"}]),
+                    ("2026-09-06T10:00:01.000Z",
+                     [{"type": "thinking", "thinking": "hidden"},
+                      {"type": "tool_use", "name": "Bash", "input": {}}]),
+                    ("2026-09-06T10:00:02.000Z",
+                     [{"type": "thinking", "thinking": "hidden"},
+                      {"type": "text", "text": "second answer"}]),
+                ):
+                    fh.write(json.dumps({
+                        "type": "assistant", "timestamp": stamp,
+                        "message": {"role": "assistant", "content": blocks}}) + "\n")
+                fh.write(json.dumps({"type": "user", "message": {
+                    "role": "user", "content": "ignored"}}) + "\n")
+                fh.write("not json\n")
+
+            self.run_cli("hook", stdin=json.dumps(
+                {"hook_event_name": "UserPromptSubmit", "prompt": "go",
+                 "transcript_path": path}), env_extra={"HERDLET_ID": "tr2"})
+
+            proc = self.run_cli("peek", "--id", "tr2", "--transcript")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("--- assistant 2026-09-06T10:00:02.000Z ---", proc.stdout)
+            self.assertIn("second answer", proc.stdout)
+            self.assertNotIn("first answer", proc.stdout)   # default is 1 message
+            self.assertNotIn("hidden", proc.stdout)         # thinking is dropped
+
+            proc = self.run_cli("peek", "--id", "tr2", "--transcript", "--lines", "5")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertLess(proc.stdout.index("first answer"),
+                            proc.stdout.index("second answer"))  # oldest first
+
+    def test_peek_transcript_without_one_dies(self):
+        self.parse(self.run_cli("report", "--id", "tr3", "--state", "working"))
+        proc = self.run_cli("peek", "--id", "tr3", "--transcript")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("no transcript recorded for tr3", proc.stderr)
+        self.assertIn("use plain peek", proc.stderr)
+
+    def test_peek_transcript_unknown_agent(self):
+        proc = self.run_cli("peek", "--id", "no-such-agent", "--transcript")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("unknown agent 'no-such-agent'", proc.stderr)
+
     def test_periodic_sweep_prunes_over_max_age(self):
         # a long-running daemon GCs records that age past the cap, no restart needed
         with tempfile.TemporaryDirectory() as tmp:
@@ -948,5 +1005,52 @@ class TimeoutResultTest(unittest.TestCase):
             {"error": {"code": "timeout", "id": "dev", "match": "ERROR"}})
         self.assertEqual(out["result"], {"type": "timeout", "agents": ["dev"],
                                          "states": [], "match": "ERROR"})
+
+
+class TranscriptParseTest(unittest.TestCase):
+    def setUp(self):
+        self.h = _load_module()
+
+    def rows(self, *entries):
+        lines = []
+        for stamp, blocks in entries:
+            lines.append(json.dumps({"type": "assistant", "timestamp": stamp,
+                                     "message": {"role": "assistant",
+                                                 "content": blocks}}))
+        return "\n".join(lines) + "\n"
+
+    def write(self, body):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "t.jsonl")
+        with open(path, "w") as fh:
+            fh.write(body)
+        return path
+
+    def test_only_text_blocks_oldest_first(self):
+        path = self.write(self.rows(
+            ("t1", [{"type": "text", "text": "one"}]),
+            ("t2", [{"type": "tool_use", "name": "Bash", "input": {}}]),
+            ("t3", [{"type": "thinking", "thinking": "secret"},
+                    {"type": "text", "text": "two"},
+                    {"type": "text", "text": "three"}])))
+        self.assertEqual(self.h.transcript_messages(path, 5),
+                         [("t1", "one"), ("t3", "two\nthree")])
+
+    def test_count_takes_the_tail(self):
+        path = self.write(self.rows(
+            ("t1", [{"type": "text", "text": "one"}]),
+            ("t2", [{"type": "text", "text": "two"}])))
+        self.assertEqual(self.h.transcript_messages(path, 1), [("t2", "two")])
+
+    def test_string_content_and_junk_lines_survive(self):
+        path = self.write(
+            json.dumps({"type": "assistant",
+                        "message": {"role": "assistant", "content": "plain"}}) + "\n"
+            + "not json\n\n"
+            + json.dumps({"type": "user", "message": {"role": "user",
+                                                      "content": "hi"}}) + "\n")
+        self.assertEqual(self.h.transcript_messages(path, 5), [(None, "plain")])
+
+
 if __name__ == "__main__":
     unittest.main()

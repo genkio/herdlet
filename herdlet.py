@@ -36,7 +36,7 @@ DEFAULT_SOCK = os.environ.get("HERDLET_SOCKET", os.path.expanduser("~/.herdlet.s
 LOG_PATH = os.path.expanduser("~/.herdlet.log")
 STATES = ("idle", "working", "spawning", "blocked", "limited", "done", "ended", "unknown")
 TERMINAL = ("done", "ended")  # agent's turn/session finished; record kept for collection + resume
-MERGE_KEYS = ("message", "agent", "pane", "cwd", "session")
+MERGE_KEYS = ("message", "agent", "pane", "cwd", "session", "transcript", "model", "effort")
 SHELLS = {"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "nu"}
 # A pane sitting at a shell only means the agent DIED if it also stopped
 # reporting. A live agent (wrapper script, `claude -p` piped to tee, a shell
@@ -142,7 +142,8 @@ class Bus:
     def report(self, agent_id, params):
         rec = self.agents.setdefault(agent_id, {
             "state": "unknown", "message": None, "agent": None,
-            "pane": None, "cwd": None, "session": None, "updated": 0.0,
+            "pane": None, "cwd": None, "session": None, "transcript": None,
+            "model": None, "effort": None, "compacts": 0, "updated": 0.0,
         })
         state = params.get("state") or rec["state"]
         rec["state"] = state
@@ -974,6 +975,8 @@ def cmd_hook(args):
         # the agent's native session ref enables `herdlet resume` later
         if data.get("session_id"):
             params["session"] = squash(str(data["session_id"]), 200)
+        if data.get("transcript_path"):
+            params["transcript"] = squash(str(data["transcript_path"]), 500)
         # message: prompt/notification text is worth showing; tool events pass
         # None so the daemon preserves the prompt across the whole turn
         if event == "UserPromptSubmit":
@@ -1005,10 +1008,55 @@ def cmd_send(args):
         tmux("send-keys", "-t", pane, "Enter", check=True)
 
 
+def transcript_messages(path, count):
+    """Last `count` (timestamp, text) assistant messages of a jsonl, oldest first."""
+    found = []
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("type") != "assistant":
+                continue
+            blocks = (row.get("message") or {}).get("content")
+            if isinstance(blocks, str):
+                blocks = [{"type": "text", "text": blocks}]
+            text = "\n".join(b.get("text") or "" for b in blocks or []
+                             if isinstance(b, dict) and b.get("type") == "text").strip()
+            if text:
+                found.append((row.get("timestamp"), text))
+    return found[-count:] if count > 0 else found
+
+
+def peek_transcript(args, lines):
+    rec = call_or_die(args.socket, "agent.get", {"id": args.id}).get("result")
+    if rec is None:
+        die(f"unknown agent '{args.id}' (see: herdlet list)")
+    path = rec.get("transcript")
+    if not path:
+        die(f"no transcript recorded for {args.id}; use plain peek")
+    if not os.path.exists(path):
+        die(f"recorded transcript is gone: {path}")
+    messages = transcript_messages(path, lines)
+    if not messages:
+        die(f"no assistant messages in {path}")
+    for stamp, text in messages:
+        print(f"--- assistant {stamp} ---" if stamp else "--- assistant ---")
+        print(text)
+
+
 def cmd_peek(args):
+    lines = args.lines if args.lines is not None else (1 if args.transcript else 60)
+    lines = max(1, lines)
+    if args.transcript:
+        return peek_transcript(args, lines)
     pane = resolve_pane(args.socket, args.id)
     flags = ["-p", "-J"] if args.join else ["-p"]
-    out = tmux("capture-pane", *flags, "-t", pane, "-S", f"-{args.lines}", check=True)
+    out = tmux("capture-pane", *flags, "-t", pane, "-S", f"-{lines}", check=True)
     print(out.rstrip("\n"))
 
 
@@ -1340,8 +1388,13 @@ def main():
 
     p = sub.add_parser("peek", help="read an agent's recent pane output")
     p.add_argument("--id", required=True, help="agent id or tmux pane id")
-    p.add_argument("--lines", type=int, default=60)
+    p.add_argument("--lines", type=int, default=None,
+                   help="pane lines (default 60), or assistant messages with "
+                        "--transcript (default 1)")
     p.add_argument("--join", action="store_true", help="unwrap soft-wrapped lines (better for logs)")
+    p.add_argument("--transcript", action="store_true",
+                   help="read the agent's own transcript jsonl instead of the "
+                        "pane: the last --lines assistant messages, verbatim")
     p.set_defaults(fn=cmd_peek)
 
     p = sub.add_parser("ack", help="mark collected results as seen: done -> idle")
