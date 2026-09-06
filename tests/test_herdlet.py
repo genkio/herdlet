@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import socket
@@ -483,6 +485,31 @@ class HerdletTest(unittest.TestCase):
                 daemon.terminate()
                 daemon.wait(timeout=5)
 
+    def test_wait_timeout_ok_is_a_result(self):
+        proc = self.run_cli("wait", "--id", "ghost", "--state", "done",
+                            "--timeout", "0.3", "--timeout-ok")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        result = json.loads(proc.stdout)["result"]
+        self.assertEqual(result["type"], "timeout")
+        self.assertEqual(result["agents"], ["ghost"])
+        self.assertEqual(result["states"], ["done"])
+
+    def test_wait_timeout_ok_keeps_prefix_and_multi_id(self):
+        proc = self.run_cli("wait", "--id", "g1,g2", "--prefix", "gp/",
+                            "--state", "done,blocked", "--timeout", "0.3",
+                            "--timeout-ok")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        result = json.loads(proc.stdout)["result"]
+        self.assertEqual(result["agents"], ["g1", "g2"])
+        self.assertEqual(result["prefix"], "gp/")
+        self.assertEqual(result["states"], ["done", "blocked"])
+
+    def test_wait_timeout_without_flag_still_exits_2(self):
+        # the documented chunk loop depends on this; --timeout-ok must be opt-in
+        proc = self.run_cli("wait", "--id", "ghost", "--state", "done", "--timeout", "0.3")
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(json.loads(proc.stdout)["error"]["code"], "timeout")
+
     def test_periodic_sweep_prunes_over_max_age(self):
         # a long-running daemon GCs records that age past the cap, no restart needed
         with tempfile.TemporaryDirectory() as tmp:
@@ -618,5 +645,96 @@ class LoadPruneTest(unittest.TestCase):
             del os.environ["HERDLET_MAX_AGE"]
 
 
+
+
+class _Args:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+class _DaemonCase(unittest.TestCase):
+    """A private daemon plus the module in-process, so tmux can be faked."""
+
+    def setUp(self):
+        self.h = _load_module()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.sock = os.path.join(self.tmp.name, "d.sock")
+        self.daemon = subprocess.Popen(
+            [sys.executable, BIN, "--socket", self.sock, "serve"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(self._stop)
+        for _ in range(50):
+            if os.path.exists(self.sock):
+                break
+            time.sleep(0.05)
+        else:
+            raise RuntimeError("daemon did not start")
+
+    def _stop(self):
+        self.daemon.terminate()
+        self.daemon.wait(timeout=5)
+
+    def record(self, agent_id):
+        return self.h.call(self.sock, "agent.get", {"id": agent_id}).get("result")
+
+
+class ApproveTimeoutTest(_DaemonCase):
+    def setUp(self):
+        self.captured = []
+        super().setUp()
+        self.h.tmux = lambda *a, **kw: self.captured.append(a) or "pane text"
+        self.h.call(self.sock, "agent.report",
+                    {"id": "ap/one", "state": "blocked", "pane": "%4"})
+
+    def args(self, **kw):
+        base = dict(socket=self.sock, id="ap/one", option="1", lines=5, settle=0.0,
+                    wait=True, state="done", timeout=0.4, timeout_ok=False)
+        base.update(kw)
+        return _Args(**base)
+
+    def approve(self, **kw):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = self.h.cmd_approve(self.args(**kw))
+        return code, out.getvalue()
+
+    def test_wait_timeout_exits_2_by_default(self):
+        code, out = self.approve()
+        self.assertIn("state: timeout", out)
+        self.assertEqual(code, 2)
+
+    def test_timeout_ok_exits_0(self):
+        code, out = self.approve(timeout_ok=True)
+        self.assertIn("state: timeout", out)   # still says so, just exits 0
+        self.assertEqual(code, 0)
+
+    def test_a_hung_daemon_still_fails_under_timeout_ok(self):
+        real = self.h.call
+
+        def hang(sock, method, params, timeout=5.0):
+            if method == "wait":
+                raise TimeoutError("hung")
+            return real(sock, method, params, timeout)
+
+        self.h.call = hang
+        self.assertEqual(self.approve(timeout_ok=True)[0], 2)
+
+
+class TimeoutResultTest(unittest.TestCase):
+    def setUp(self):
+        self.h = _load_module()
+
+    def test_non_timeout_responses_pass_through(self):
+        resp = {"id": "1", "result": {"type": "waited"}}
+        self.assertIs(self.h.timeout_as_result(resp), resp)
+        err = {"id": "1", "error": {"code": "not_found"}}
+        self.assertIs(self.h.timeout_as_result(err), err)
+
+    def test_match_timeout_keeps_the_regex(self):
+        out = self.h.timeout_as_result(
+            {"error": {"code": "timeout", "id": "dev", "match": "ERROR"}})
+        self.assertEqual(out["result"], {"type": "timeout", "agents": ["dev"],
+                                         "states": [], "match": "ERROR"})
 if __name__ == "__main__":
     unittest.main()

@@ -609,6 +609,23 @@ def cmd_list(args):
         print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row[:6])) + "  " + row[6])
 
 
+def timeout_as_result(resp):
+    """Rewrite a timeout error as a result, client-side so old daemons work too."""
+    err = (resp or {}).get("error") or {}
+    if err.get("code") != "timeout":
+        return resp
+    result = {"type": "timeout",
+              "agents": err.get("agents") or ([err["id"]] if err.get("id") else []),
+              "states": err.get("states") or []}
+    for key in ("prefix", "match"):
+        if err.get(key):
+            result[key] = err[key]
+    out = {"result": result}
+    if resp.get("id") is not None:
+        out = {"id": resp["id"], **out}
+    return out
+
+
 def wait_for_match(args, ids):
     if args.prefix or len(ids) != 1:
         die("--match takes exactly one --id and no --prefix")
@@ -628,8 +645,11 @@ def wait_for_match(args, ids):
                                              "id": ids[0], "line": line}}, indent=2))
                 return 0
         if deadline is not None and time.time() >= deadline:
-            print(json.dumps({"error": {"code": "timeout", "id": ids[0],
-                                        "match": args.match}}, indent=2))
+            resp = {"error": {"code": "timeout", "id": ids[0], "match": args.match}}
+            if args.timeout_ok:
+                print(json.dumps(timeout_as_result(resp), indent=2))
+                return 0
+            print(json.dumps(resp, indent=2))
             return 2
         time.sleep(2)
 
@@ -659,7 +679,8 @@ def cmd_wait(args):
         params["timeout_ms"] = int(args.timeout * 1000)
     client_timeout = args.timeout + 5 if args.timeout else None
     try:
-        emit(call(args.socket, "wait", params, timeout=client_timeout))
+        resp = call(args.socket, "wait", params, timeout=client_timeout)
+        emit(timeout_as_result(resp) if args.timeout_ok else resp)
     except (FileNotFoundError, ConnectionRefusedError):
         die(f"herdlet daemon is not running on {args.socket} (start it with: herdlet serve)")
 
@@ -985,11 +1006,12 @@ def cmd_approve(args):
     if args.timeout:
         params["timeout_ms"] = int(args.timeout * 1000)
     client_timeout = args.timeout + 5 if args.timeout else None
+    hung = False
     try:
         resp = call(args.socket, "wait", params, timeout=client_timeout)
         state = resp["result"]["state"] if "result" in resp else "timeout"
-    except TimeoutError:  # hung daemon: treat like a normal wait timeout, not unreachable
-        state = "timeout"
+    except TimeoutError:  # hung daemon: still a failure, whatever --timeout-ok says
+        state, hung = "timeout", True
     except OSError:
         out = tmux("capture-pane", "-p", "-t", pane, "-S", f"-{args.lines}", check=True)
         print(out.rstrip("\n"))
@@ -998,7 +1020,9 @@ def cmd_approve(args):
     out = tmux("capture-pane", "-p", "-t", pane, "-S", f"-{args.lines}", check=True)
     print(f"state: {state}")
     print(out.rstrip("\n"))
-    return 0 if state != "timeout" else 2
+    if state != "timeout":
+        return 0
+    return 0 if args.timeout_ok and not hung else 2
 
 
 COLORS = {"working": "\033[33m", "blocked": "\033[1;31m", "done": "\033[32m",
@@ -1199,6 +1223,10 @@ def main():
     p.add_argument("--edge", action="store_true",
                    help="ignore the current state; wake only on a fresh report "
                         "(use right after answering a menu, to avoid matching the stale state)")
+    p.add_argument("--timeout-ok", action="store_true",
+                   help="a timeout is a result, not an error: exit 0 with "
+                        "result.type 'timeout' (for harnesses that read a "
+                        "background command's exit code as failure)")
     p.set_defaults(fn=cmd_wait)
 
     p = sub.add_parser("watch", help="stream state-change events as JSON lines")
@@ -1249,6 +1277,8 @@ def main():
                    help="target state(s) for --wait, comma-separated (default: done,blocked)")
     p.add_argument("--timeout", type=float, default=550,
                    help="seconds for --wait (default: 550)")
+    p.add_argument("--timeout-ok", action="store_true",
+                   help="exit 0 instead of 2 when --wait times out")
     p.set_defaults(fn=cmd_approve)
 
     p = sub.add_parser("monitor", help="live status view (made for a tmux popup)")
