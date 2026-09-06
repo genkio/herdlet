@@ -27,9 +27,14 @@ import time
 
 __version__ = "0.6.3"
 
+
+def _log(*parts):
+    print(time.strftime("%H:%M:%S"), *parts, flush=True)
+
+
 DEFAULT_SOCK = os.environ.get("HERDLET_SOCKET", os.path.expanduser("~/.herdlet.sock"))
 LOG_PATH = os.path.expanduser("~/.herdlet.log")
-STATES = ("idle", "working", "blocked", "done", "ended", "unknown")
+STATES = ("idle", "working", "spawning", "blocked", "limited", "done", "ended", "unknown")
 TERMINAL = ("done", "ended")  # agent's turn/session finished; record kept for collection + resume
 MERGE_KEYS = ("message", "agent", "pane", "cwd", "session")
 SHELLS = {"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "nu"}
@@ -55,6 +60,26 @@ BLOCKED_REEMIT = float(os.environ.get("HERDLET_BLOCKED_REEMIT", "30"))
 # and also prunes on load. 0 disables the cap / the sweep respectively.
 MAX_AGE = float(os.environ.get("HERDLET_MAX_AGE", str(3 * 86400)))
 PRUNE_INTERVAL = float(os.environ.get("HERDLET_PRUNE_INTERVAL", "3600"))
+# An agent parked on a usage-limit banner fires no hook, so the daemon scrapes
+# its pane and reports `limited` instead. Wording is Claude Code 2.1.263's own;
+# fast-mode limits are out because fast mode falls back to the normal one.
+LIMIT_PATTERN_DEFAULT = (
+    r"usage limit reached"
+    r"|you.?ve (hit|reached) your\b(?! fast\b)"
+    r"|you.?re out of (usage|extra usage)"
+    r"|your org is out of usage"
+    r"|your seat type doesn.?t include usage credits"
+    r"|(session|weekly|monthly spend) limit reached"
+    r"|your usage limit has reset"
+    r"|when your limit resets"
+)
+LIMIT_INTERVAL = float(os.environ.get("HERDLET_LIMIT_INTERVAL", "30"))
+LIMIT_SWEEP = os.environ.get("HERDLET_LIMIT_SWEEP", "1") not in ("0", "false", "no")
+# Claude Code draws the banner just above the input box, so only the bottom of
+# the VISIBLE pane can hold a real one; scrollback is old news at best.
+LIMIT_TAIL = 8
+LIMIT_WATCH = ("working", "spawning")  # `blocked` is already a wake signal
+LIMIT_RE = None  # compiled by the daemon, its only consumer (see limit_regex)
 RESUME = {
     "claude": "claude --resume {session}",
     "codex": "codex resume {session}",
@@ -69,6 +94,8 @@ class Bus:
         self.subscribers = set()  # (queue, id_filter, state_filter)
         self.waiters = []      # (predicate, future)
         self._reemit = {}      # id -> TimerHandle: live re-announce of `blocked`
+        self._limit_timer = None
+        self._limit_task = None
         self._load()
 
     def _load(self):
@@ -221,13 +248,54 @@ class Bus:
             self._save()
         self.start_prune_sweeps()
 
+    def start_limit_sweeps(self, capture=None):
+        if not LIMIT_SWEEP or LIMIT_INTERVAL <= 0:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._limit_timer = loop.call_later(
+            LIMIT_INTERVAL, self._fire_limit_sweep, capture)
+
+    def _fire_limit_sweep(self, capture):
+        self._limit_task = asyncio.ensure_future(self.limit_sweep(capture))
+
+    async def limit_sweep(self, capture=None):
+        capture = capture or capture_pane
+        loop = asyncio.get_running_loop()
+        try:
+            for aid in list(self.agents):
+                try:
+                    rec = self.agents.get(aid)
+                    if not self._scrapable(rec):
+                        continue
+                    # off-loop: capture-pane on a dead pane or a missing tmux
+                    # must never stall (or kill) the daemon
+                    text = await loop.run_in_executor(None, capture, rec["pane"])
+                    if not text or not limit_regex().search(limit_tail(text)):
+                        continue
+                    # the await gave the record time to move on, and a banner
+                    # still on screen after an auto-resume must not re-flip it
+                    rec = self.agents.get(aid)
+                    if (not self._scrapable(rec)
+                            or time.time() - rec.get("updated", 0) <= LIMIT_INTERVAL):
+                        continue
+                    _log("limited", aid, rec["pane"])
+                    self.report(aid, {"state": "limited",
+                                      "message": "usage limit banner in pane"})
+                except Exception:
+                    continue
+        finally:
+            self.start_limit_sweeps(capture)
+
+    @staticmethod
+    def _scrapable(rec):
+        return bool(rec and rec.get("state") in LIMIT_WATCH and rec.get("pane"))
+
 
 def _send(writer, obj):
     writer.write((json.dumps(obj) + "\n").encode())
-
-
-def _log(*parts):
-    print(time.strftime("%H:%M:%S"), *parts, flush=True)
 
 
 async def _handle_client(reader, writer, bus):
@@ -363,9 +431,23 @@ async def _handle_subscribe(reader, writer, bus, rid, params):
         bus.subscribers.discard(entry)
 
 
+def limit_regex():
+    global LIMIT_RE
+    if LIMIT_RE is None:
+        pattern = os.environ.get("HERDLET_LIMIT_PATTERN", LIMIT_PATTERN_DEFAULT)
+        try:
+            LIMIT_RE = re.compile(pattern, re.I)
+        except re.error as exc:
+            _log(f"bad HERDLET_LIMIT_PATTERN ({exc}); using the default")
+            LIMIT_RE = re.compile(LIMIT_PATTERN_DEFAULT, re.I)
+    return LIMIT_RE
+
+
 async def _serve(sock_path):
+    limit_regex()  # compile here, so a bad pattern is logged once, by the daemon
     bus = Bus(state_path=sock_path + ".state")
     bus.start_prune_sweeps()
+    bus.start_limit_sweeps()
     server = await asyncio.start_unix_server(
         lambda r, w: _handle_client(r, w, bus), path=sock_path)
     os.chmod(sock_path, 0o600)
@@ -478,6 +560,15 @@ def tmux(*args, check=False, input=None):
     return out.stdout
 
 
+def capture_pane(pane):
+    """Visible pane text, or '' if tmux or the pane is gone."""
+    return tmux("capture-pane", "-p", "-J", "-t", pane) or ""
+
+
+def limit_tail(text, lines=LIMIT_TAIL):
+    return "\n".join([l for l in text.splitlines() if l.strip()][-lines:])
+
+
 def pane_map():
     out = tmux("list-panes", "-a", "-F",
                "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}"
@@ -539,9 +630,9 @@ def cmd_remove(args):
 
 
 def sort_key(rec):
-    order = {"blocked": 0, "stale": 1, "gone": 2, "working": 3, "done": 4,
-             "ended": 5, "idle": 6}
-    return (order.get(rec["state"], 7), -rec["updated"])
+    order = {"blocked": 0, "limited": 1, "stale": 2, "gone": 3, "working": 4,
+             "spawning": 5, "done": 6, "ended": 7, "idle": 8}
+    return (order.get(rec["state"], 9), -rec["updated"])
 
 
 def age(seconds):
@@ -566,7 +657,7 @@ def annotate(agents, panes):
         # freshness check is what keeps a just-spawned or actively-hooking worker
         # (whose pane_current_command is a shell) from being called stale while
         # it is plainly alive - the friction that made one-shot workers unusable.
-        if (info and rec["state"] in ("working", "blocked")
+        if (info and rec["state"] in ("working", "blocked", "spawning", "limited")
                 and info.get("command") in SHELLS
                 and now - rec["updated"] > STALE_AFTER):
             rec["state"] = "stale"
@@ -1027,7 +1118,8 @@ def cmd_approve(args):
 
 COLORS = {"working": "\033[33m", "blocked": "\033[1;31m", "done": "\033[32m",
           "idle": "\033[2m", "unknown": "\033[2m", "gone": "\033[35m",
-          "stale": "\033[31m", "ended": "\033[2m"}
+          "stale": "\033[31m", "ended": "\033[2m", "limited": "\033[1;35m",
+          "spawning": "\033[36m"}
 RESET = "\033[0m"
 DIM = "\033[2m"
 BOLD = "\033[1m"

@@ -647,6 +647,218 @@ class LoadPruneTest(unittest.TestCase):
 
 
 
+class LimitSweepTest(unittest.TestCase):
+    """The sweep is pure over (records, captured pane text), so inject a fake
+    capture instead of driving real panes."""
+
+    def setUp(self):
+        self.h = _load_module()
+        self.bus = self.h.Bus()
+        self.quiet("w", "working", "%1")
+
+    def quiet(self, agent_id, state, pane="%1", ago=None):
+        """A record in `state` that has been silent for longer than one tick."""
+        self.bus.report(agent_id, {"state": state, "pane": pane})
+        ago = self.h.LIMIT_INTERVAL + 1 if ago is None else ago
+        self.bus.agents[agent_id]["updated"] = time.time() - ago
+        return self.bus.agents[agent_id]
+
+    def sweep(self, capture):
+        import asyncio
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):   # the daemon log line
+            asyncio.run(self.bus.limit_sweep(capture))
+        self.logged = out.getvalue()
+
+    def test_banner_flips_working_to_limited(self):
+        self.sweep(lambda pane: "Usage limit reached · continuing automatically")
+        rec = self.bus.agents["w"]
+        self.assertEqual(rec["state"], "limited")
+        self.assertEqual(rec["message"], "usage limit banner in pane")
+        self.assertIn("limited w %1", self.logged)
+
+    def test_real_claude_banner_wordings_all_match(self):
+        for banner in ("You've hit your session limit · resets 3pm",
+                       "You've reached your weekly limit",
+                       "Usage limit reached · finishing up",
+                       "You're out of usage credits. /model to switch models.",
+                       "Your org is out of usage · contact your admin",
+                       "Your seat type doesn't include usage credits",
+                       "Your usage limit has reset · press enter to continue",
+                       "Continuing automatically when your limit resets · esc to cancel"):
+            self.setUp()
+            self.sweep(lambda pane, b=banner: b)
+            self.assertEqual(self.bus.agents["w"]["state"], "limited", banner)
+
+    def test_fast_mode_limits_are_not_a_stop(self):
+        # fast mode falls back to the normal one, so the agent keeps working
+        for banner in ("You've hit your fast limit · resets in 2h",
+                       "Fast mode overloaded and is temporarily unavailable · resets in 1h",
+                       "Fast limit reached and temporarily disabled · resets in 1h"):
+            self.setUp()
+            self.sweep(lambda pane, b=banner: b)
+            self.assertEqual(self.bus.agents["w"]["state"], "working", banner)
+
+    def test_approaching_is_a_warning_not_a_stop(self):
+        self.sweep(lambda pane:
+                   "Approaching your 5-hour usage limit - Claude will wrap up")
+        self.assertEqual(self.bus.agents["w"]["state"], "working")
+
+    def test_ordinary_output_is_left_alone(self):
+        self.sweep(lambda pane: "running the test suite\n48 passed")
+        self.assertEqual(self.bus.agents["w"]["state"], "working")
+
+    def test_only_the_bottom_of_the_pane_counts(self):
+        # scrollback holding an old banner is not a live one; Claude Code draws
+        # the real banner right above the input box
+        old = "Usage limit reached\n" + "\n".join(f"line {i}" for i in range(20))
+        self.sweep(lambda pane: old)
+        self.assertEqual(self.bus.agents["w"]["state"], "working")
+        self.sweep(lambda pane: "\n".join(f"line {i}" for i in range(20))
+                   + "\n\n\n  Usage limit reached · continuing shortly\n\n> ")
+        self.assertEqual(self.bus.agents["w"]["state"], "limited")
+
+    def test_a_record_that_just_reported_is_left_alone(self):
+        # an auto-resumed worker is reporting again while the banner is still on
+        # screen: it must not be flipped back to limited every tick
+        self.quiet("w", "working", ago=0)
+        self.sweep(lambda pane: "Usage limit reached")
+        self.assertEqual(self.bus.agents["w"]["state"], "working")
+
+    def test_a_state_change_during_the_capture_is_not_clobbered(self):
+        def capture(pane):
+            self.bus.report("w", {"state": "done", "message": "finished"})
+            return "Usage limit reached"
+
+        self.sweep(capture)
+        self.assertEqual(self.bus.agents["w"]["state"], "done")
+        self.assertEqual(self.bus.agents["w"]["message"], "finished")
+
+    def test_the_state_re_read_alone_stops_the_clobber(self):
+        # same race, but the record is also aged past a tick, so the freshness
+        # guard cannot be what saves it: only re-reading the state can
+        def capture(pane):
+            self.bus.report("w", {"state": "done", "message": "finished"})
+            self.bus.agents["w"]["updated"] = time.time() - self.h.LIMIT_INTERVAL - 1
+            return "Usage limit reached"
+
+        self.sweep(capture)
+        self.assertEqual(self.bus.agents["w"]["state"], "done")
+        self.assertEqual(self.bus.agents["w"]["message"], "finished")
+        self.assertEqual(self.logged, "")
+
+    def test_blocked_is_not_scraped(self):
+        # a blocked record is already a wake signal, and flipping it would
+        # cancel its re-announce
+        self.quiet("b", "blocked", "%2")
+        seen = []
+        self.sweep(lambda pane: seen.append(pane) or "")
+        self.assertNotIn("%2", seen)
+
+    def test_idle_and_done_panes_are_not_scraped(self):
+        for state in ("idle", "done", "ended", "limited"):
+            self.bus = self.h.Bus()
+            self.quiet("w", state)
+            seen = []
+            self.sweep(lambda pane: seen.append(pane) or "")
+            self.assertEqual(seen, [], state)
+
+    def test_spawning_is_scraped(self):
+        self.quiet("s", "spawning", "%3")
+        seen = []
+        self.sweep(lambda pane: seen.append(pane) or "")
+        self.assertIn("%3", seen)
+
+    def test_record_without_a_pane_is_skipped(self):
+        self.bus = self.h.Bus()
+        self.quiet("nopane", "working", pane=None)
+        seen = []
+        self.sweep(lambda pane: seen.append(pane) or "")
+        self.assertEqual(seen, [])
+
+    def test_capture_failure_never_kills_the_sweep(self):
+        # tmux missing, or the pane gone: treat as no match, keep going
+        def boom(pane):
+            raise OSError("no server running")
+
+        self.sweep(boom)
+        self.assertEqual(self.bus.agents["w"]["state"], "working")
+        self.sweep(lambda pane: "")
+        self.assertEqual(self.bus.agents["w"]["state"], "working")
+
+    def test_one_bad_record_does_not_stop_the_rest(self):
+        self.quiet("z", "working", "%9")
+        seen = []
+
+        def capture(pane):
+            seen.append(pane)
+            if pane == "%1":
+                raise OSError("gone")
+            return ""
+
+        self.sweep(capture)
+        self.assertEqual(sorted(seen), ["%1", "%9"])
+
+    def test_a_broken_env_pattern_falls_back_to_the_default(self):
+        os.environ["HERDLET_LIMIT_PATTERN"] = "(unclosed"
+        try:
+            h = _load_module()
+            self.assertIsNone(h.LIMIT_RE)   # nothing compiled at import
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertTrue(h.limit_regex().search("Usage limit reached"))
+            self.assertIn("bad HERDLET_LIMIT_PATTERN", out.getvalue())
+        finally:
+            del os.environ["HERDLET_LIMIT_PATTERN"]
+
+    def test_a_client_command_compiles_nothing(self):
+        # the pattern is the daemon's business; a client must not pay for it or
+        # print about it
+        self.assertIsNone(_load_module().LIMIT_RE)
+
+    def test_limited_wakes_waiters(self):
+        woken = []
+        self.bus.waiters.append(
+            (lambda i, s: s == "limited", _FakeFuture(woken)))
+        self.sweep(lambda pane: "Usage limit reached")
+        self.assertEqual(len(woken), 1)
+
+    def test_limited_is_live_not_terminal(self):
+        self.assertNotIn("limited", self.h.TERMINAL)
+        self.assertNotIn("spawning", self.h.TERMINAL)
+        rec = {"state": "limited", "updated": time.time() - self.h.TERMINAL_TTL - 100}
+        self.assertFalse(self.h.Bus()._prunable(rec, time.time()))
+
+    def test_limited_at_a_dead_shell_still_goes_stale(self):
+        # the pane fell back to a shell AND the record went quiet: the process
+        # died, so this needs `resume`, not a wait for the reset
+        rec = {"state": "limited", "pane": "%1", "message": "", "agent": "claude",
+               "session": "s", "cwd": "/tmp",
+               "updated": time.time() - self.h.STALE_AFTER - 30}
+        panes = {"%1": {"session": "h", "window_index": "1", "window_name": "w",
+                        "command": "zsh"}}
+        self.assertEqual(self.h.annotate([rec], panes)[0]["state"], "stale")
+
+    def test_limited_agent_still_running_is_not_stale(self):
+        rec = {"state": "limited", "pane": "%1", "message": "", "agent": "claude",
+               "session": "s", "cwd": "/tmp",
+               "updated": time.time() - self.h.STALE_AFTER - 30}
+        panes = {"%1": {"session": "h", "window_index": "1", "window_name": "w",
+                        "command": "node"}}
+        self.assertEqual(self.h.annotate([rec], panes)[0]["state"], "limited")
+
+
+class _FakeFuture:
+    def __init__(self, sink):
+        self.sink = sink
+
+    def done(self):
+        return False
+
+    def set_result(self, value):
+        self.sink.append(value)
+
+
 class _Args:
     def __init__(self, **kw):
         self.__dict__.update(kw)
