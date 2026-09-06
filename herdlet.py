@@ -994,18 +994,42 @@ def cmd_hook(args):
     return 0
 
 
-def cmd_send(args):
-    pane = resolve_pane(args.socket, args.id)
-    text = " ".join(args.text)
-    if "\n" in text:
+# Typed character by character, a long message races the Enter that follows it
+# and gets submitted in half. A bracketed paste is one atomic block, so route
+# anything long that way; it also sidesteps tmux's 16 KiB command-line ceiling.
+SEND_PASTE_OVER = 200
+
+
+def send_text(pane, text, no_enter=False):
+    if "\n" in text or len(text) > SEND_PASTE_OVER:
         # bracketed paste: a readline TUI takes the newlines as text, not submits
-        tmux("load-buffer", "-b", "herdlet-send", "-", input=text, check=True)
-        tmux("paste-buffer", "-p", "-d", "-b", "herdlet-send", "-t", pane, check=True)
+        buf = f"herdlet-send-{os.getpid()}"
+        tmux("load-buffer", "-b", buf, "-", input=text, check=True)
+        tmux("paste-buffer", "-p", "-d", "-b", buf, "-t", pane, check=True)
     else:
         tmux("send-keys", "-t", pane, "-l", "--", text, check=True)
-    if not args.no_enter:
+    if not no_enter:
         time.sleep(0.2)  # let the TUI ingest the text before submit
         tmux("send-keys", "-t", pane, "Enter", check=True)
+
+
+def cmd_send(args):
+    if args.text and args.file:
+        die("pass either positional text or --file PATH ('-' for stdin), not both")
+    if not args.text and not args.file:
+        die("nothing to send: pass text or --file PATH")
+    if args.file:
+        try:
+            text = sys.stdin.read() if args.file == "-" else open(args.file).read()
+        except OSError as exc:
+            die(f"cannot read {args.file}: {exc}")
+        text = text.rstrip("\n")
+    else:
+        text = " ".join(args.text)
+    if not text:
+        die(f"nothing to send: {args.file} is empty" if args.file
+            else "nothing to send: the message is empty")
+    send_text(resolve_pane(args.socket, args.id), text, args.no_enter)
 
 
 def transcript_messages(path, count):
@@ -1383,7 +1407,9 @@ def main():
     p = sub.add_parser("send", help="type text into an agent's pane (submits with Enter)")
     p.add_argument("--id", required=True, help="agent id or tmux pane id")
     p.add_argument("--no-enter", action="store_true")
-    p.add_argument("text", nargs="+")
+    p.add_argument("--file", help="read the message from PATH ('-' for stdin) "
+                                  "instead of the positional text")
+    p.add_argument("text", nargs="*")
     p.set_defaults(fn=cmd_send)
 
     p = sub.add_parser("peek", help="read an agent's recent pane output")

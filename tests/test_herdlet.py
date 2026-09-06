@@ -562,10 +562,32 @@ class HerdletTest(unittest.TestCase):
         self.assertIn("no transcript recorded for tr3", proc.stderr)
         self.assertIn("use plain peek", proc.stderr)
 
+    def test_send_requires_exactly_one_source(self):
+        proc = self.run_cli("send", "--id", "%1")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("nothing to send: pass text or --file PATH", proc.stderr)
+        proc = self.run_cli("send", "--id", "%1", "--file", "/tmp/x", "hello")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("not both", proc.stderr)
+
+    def test_send_empty_file_says_so(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "empty.md")
+            open(path, "w").close()
+            proc = self.run_cli("send", "--id", "%1", "--file", path)
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("is empty", proc.stderr)
+
     def test_peek_transcript_unknown_agent(self):
         proc = self.run_cli("peek", "--id", "no-such-agent", "--transcript")
         self.assertEqual(proc.returncode, 1)
         self.assertIn("unknown agent 'no-such-agent'", proc.stderr)
+
+    def test_send_file_must_exist(self):
+        proc = self.run_cli("send", "--id", "%1", "--file",
+                            "/tmp/herdlet-no-such-file.txt")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("cannot read", proc.stderr)
 
     def test_periodic_sweep_prunes_over_max_age(self):
         # a long-running daemon GCs records that age past the cap, no restart needed
@@ -914,6 +936,43 @@ class _FakeFuture:
 
     def set_result(self, value):
         self.sink.append(value)
+
+
+class SendRoutingTest(unittest.TestCase):
+    def setUp(self):
+        self.h = _load_module()
+        self.calls = []
+        self.h.tmux = lambda *args, **kw: self.calls.append((args, kw)) or ""
+
+    def verbs(self):
+        return [args[0] for args, _ in self.calls]
+
+    def test_short_text_is_typed(self):
+        self.h.send_text("%1", "run the tests")
+        self.assertEqual(self.verbs(), ["send-keys", "send-keys"])
+
+    def test_long_single_line_text_is_pasted(self):
+        # the friction: one giant argv either trips tmux's 16 KiB command limit
+        # or races the Enter, so anything long goes through a buffer paste
+        text = "a" * 6144
+        self.h.send_text("%1", text)
+        self.assertEqual(self.verbs(), ["load-buffer", "paste-buffer", "send-keys"])
+        self.assertEqual(self.calls[0][1]["input"], text)
+
+    def test_multiline_text_is_pasted(self):
+        self.h.send_text("%1", "line one\nline two")
+        self.assertEqual(self.verbs(), ["load-buffer", "paste-buffer", "send-keys"])
+
+    def test_boundary_is_the_documented_length(self):
+        self.h.send_text("%1", "a" * self.h.SEND_PASTE_OVER)
+        self.assertEqual(self.verbs()[0], "send-keys")
+        self.calls.clear()
+        self.h.send_text("%1", "a" * (self.h.SEND_PASTE_OVER + 1))
+        self.assertEqual(self.verbs()[0], "load-buffer")
+
+    def test_no_enter_skips_the_submit(self):
+        self.h.send_text("%1", "typed only", no_enter=True)
+        self.assertEqual(self.verbs(), ["send-keys"])
 
 
 class _Args:
