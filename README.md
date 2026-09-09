@@ -46,10 +46,11 @@ wiring? The snippets are below.
 
 There is no daemon to babysit: `hook`, `report`, `spawn` and `monitor`
 auto-start it on first use (`herdlet serve` runs it in the foreground if you
-prefer). After upgrading, restart it so the 0.7.0 daemon-side features are
-served: the `limited` sweep, the `transcript` / `model` / `effort` merge keys,
-and the `compacts` counter. Run `pkill -f 'herdlet.*serve'` and then any herdlet
-command; agents re-register on their next hook event. Every command except
+prefer). After upgrading, restart it so the 0.8.0 daemon-side features are
+served: `pair` / `unpair` and the `peer_send` event, the `limited` sweep, the
+`transcript` / `model` / `effort` merge keys, and the `compacts` counter. Run
+`pkill -f 'herdlet.*serve'` and then any herdlet command; agents re-register on
+their next hook event. Every command except
 `hook` warns on stderr when it finds a daemon older than itself.
 
 ## Quickstart
@@ -78,6 +79,7 @@ herdlet peek --id builder --lines 40             # read builder's recent output 
 herdlet peek --id builder --transcript --lines 2 # read builder's own transcript instead of the pane
 herdlet approve --id builder                     # answer a permission menu (option 1), echo the pane
 herdlet approve --id builder --wait              # answer, mark working, edge-wait for the next transition, show the pane
+herdlet pair --id dev --with tester --topic plans/repro.md  # scoped peer channel between two workers
 herdlet ack --id builder                         # collected the result: done -> idle (list = inbox)
 herdlet resume --id builder                      # agent died? type its native resume command into the pane
 herdlet monitor                                  # live TUI (made for a tmux popup)
@@ -241,10 +243,11 @@ herdlet spawn --id personal/herdlet/tester --model haiku  --effort low    --brie
 
 `spawn` splits the caller's own pane, builds the launch line (mute env vars,
 classic renderer, `HERDLET_ID`, a session name, the model and effort you asked
-for), registers the worker as `spawning` before its first hook fires, waits for
-that hook, then hands it its brief. `--model` and `--effort` are required on
-purpose: a worker is a top-level session, so anything you do not pin explicitly
-runs on your MAIN (priciest) model, and that is the whole cost lever. Other
+for), registers the worker as `spawning` before its first hook fires, links
+itself to it one way (see "Peer channel"), waits for that hook, then hands it
+its brief. `--model` and `--effort` are required on purpose: a worker is a
+top-level session, so anything you do not pin explicitly runs on your MAIN
+(priciest) model, and that is the whole cost lever. Other
 agents (codex, opencode, a wrapper that sets a custom endpoint) still launch by
 hand with `tmux split-window`; see the skill for that recipe.
 
@@ -298,6 +301,74 @@ provision worker permissions at spawn time instead of babysitting menus, wait
 on the whole herd in one long call, and prefer short-lived phase-scoped workers
 over one pane dragging a huge context through an entire project.
 
+## Peer channel
+
+By default the master is the only hub: every worker-to-worker exchange goes
+through it and costs the expensive thread a turn. Two loops don't need it:
+
+- **implementer <-> tester** - repro steps, "fixed, retest", which log line to
+  look at
+- **reviewer <-> implementer** - minor findings, "that's intentional, here's
+  why"
+
+`pair` gives those two a direct channel, scoped so it can't grow into a second
+management layer:
+
+```bash
+herdlet pair --id proj/dev --with proj/tester --topic plans/repro.md
+herdlet unpair --id proj/dev --with proj/tester
+```
+
+The link is symmetric: both records gain `peers: ["<other>"]` and a `topics`
+entry (`herdlet get`, `list --json`, and a `PEERS` column in `list` when anyone
+has one). An agent may have several peers. Both ids must already be registered.
+
+The scope rule: a worker's own `herdlet send` (identified by `$HERDLET_ID`) may
+only reach a peer it was paired with. Anything else is refused with exit 3 and
+`not paired with <target>; raise it in your report to the master`, so scope,
+interface and money decisions stay on the one-way path up. The master itself has
+no `$HERDLET_ID` and can still send anywhere.
+
+It is a guardrail, not a sandbox: `HERDLET_ID= herdlet send ...`, `approve` and
+`resume` all reach any pane, and an agent that shells out to `tmux send-keys`
+was never going through herdlet in the first place. Its job is to keep the
+default path honest, so a worker escalates by habit instead of quietly building
+a second management layer.
+
+`spawn` links the spawner to the worker it just created, so a nested master
+(which `spawn` gives a `HERDLET_ID`, making it a worker to the rule above) can
+still drive its own children. That link is **one-directional**: only the
+spawner's record gains the child, so the child has no shortcut back into its
+master's pane - it reports upward like any other worker. The topic is the
+`--brief` path, or `<cwd>/plans/<id with / as ->-thread.md` when there is no
+brief. Only an explicit `herdlet pair` is symmetric; `unpair`, `remove` and the
+prune sweep clean both sides either way. In short: you may talk to what you
+spawned, and to whoever the master paired you with.
+
+Every peer send appends one line to the topic file, under a `## Thread` heading
+created on first use:
+
+```
+## Thread
+
+- 2026-09-09T14:02:11+0900 proj/dev -> proj/tester: fixed in abc123, please retest
+```
+
+The line is the first 120 characters, newlines collapsed - the full text went
+to the pane, and the file is an audit trail, not a message queue. The daemon
+emits a `peer_send` event (`from`, `to`, `topic`, `chars`) on `herdlet watch`
+and touches no record, so a wait on the master's OWN state is never woken. The
+receiving peer still transitions through its own hooks, so a master waiting on
+that peer's `done` does wake, exactly as before. Peers survive `resume` and an
+`ack` that flips `done` -> `idle`; acking an `ended` agent removes its record,
+and `remove` drops the id from its peers' lists.
+
+Pattern for the master to paste into a worker's brief:
+
+> You are paired with `<id>` on `<topic>`. Send it repros and answers directly
+> with `herdlet send --id <id> ...`. Do not copy the master. Decisions about
+> scope, interface or money go in your report, not to your peer.
+
 ## Protocol
 
 Newline-delimited JSON over `~/.herdlet.sock` (override with `--socket` or
@@ -305,6 +376,9 @@ Newline-delimited JSON over `~/.herdlet.sock` (override with `--socket` or
 `{"id", "result"}` or `{"id", "error"}`.
 
 Methods: `ping`, `agent.report`, `agent.get`, `agent.list`, `agent.remove`,
+`agent.pair` / `agent.unpair` (`{id, with, topic}`, symmetric unless
+`agent.pair` gets `oneway: true`, which links `id -> with` only), `peer.send`
+(`{from, to, topic, chars}`, fans out a `peer_send` event and nothing else),
 `wait` (`{id | ids | prefix, states, timeout_ms, edge?}`, wakes on the first
 matching agent; the result carries `matched`, every agent currently in a
 target state, so a herd wait can batch-collect instead of re-waiting per
@@ -319,7 +393,9 @@ Report merge semantics: absent/null fields preserve the previous value, empty
 string clears (merge keys: `message`, `agent`, `pane`, `cwd`, `session`,
 `transcript`, `model`, `effort`). Tool-use hooks report `message: null`, which
 is why the prompt survives as the message for the whole turn. `compacts` is a
-daemon-side counter, bumped by `{"compact": true}` reports.
+daemon-side counter, bumped by `{"compact": true}` reports. `peers` / `topics`
+are owned by `agent.pair`, never by a report, and default to `[]` / `{}` on a
+record written by an older daemon.
 
 Environment: `HERDLET_SOCKET`, `HERDLET_ID`, `HERDLET_SKIP`,
 `HERDLET_BLOCKED_REEMIT`, `HERDLET_MAX_AGE`, `HERDLET_PRUNE_INTERVAL`,

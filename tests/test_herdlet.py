@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -638,6 +639,187 @@ class HerdletTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("MODEL", proc.stdout.splitlines()[0])
 
+    def fake_tmux(self):
+        """A tmux stub on PATH, so `send` can type without a real server."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "tmux")
+        with open(path, "w") as fh:
+            fh.write('#!/bin/sh\nprintf "%s\\n" "$*" >> "$(dirname "$0")/log"\n')
+        os.chmod(path, 0o755)
+        return {"PATH": d + os.pathsep + os.environ["PATH"]}, os.path.join(d, "log")
+
+    def test_pair_links_both_records(self):
+        self.parse(self.run_cli("report", "--id", "pr/a", "--state", "idle"))
+        self.parse(self.run_cli("report", "--id", "pr/b", "--state", "idle"))
+        resp = self.parse(self.run_cli("pair", "--id", "pr/a", "--with", "pr/b",
+                                       "--topic", "plans/pr.md"))
+        topic = os.path.abspath("plans/pr.md")
+        self.assertEqual(resp["result"]["topic"], topic)
+        for one, other in (("pr/a", "pr/b"), ("pr/b", "pr/a")):
+            rec = self.parse(self.run_cli("get", "--id", one))["result"]
+            self.assertEqual(rec["peers"], [other])
+            self.assertEqual(rec["topics"], {other: topic})
+        # idempotent: no duplicate peer entries
+        self.parse(self.run_cli("pair", "--id", "pr/a", "--with", "pr/b",
+                                "--topic", "plans/pr.md"))
+        rec = self.parse(self.run_cli("get", "--id", "pr/a"))["result"]
+        self.assertEqual(rec["peers"], ["pr/b"])
+
+    def test_pair_refuses_an_unregistered_id(self):
+        self.parse(self.run_cli("report", "--id", "pu/a", "--state", "idle"))
+        proc = self.run_cli("pair", "--id", "pu/a", "--with", "pu/ghost",
+                            "--topic", "t.md")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("unknown agent 'pu/ghost'", proc.stderr)
+        rec = self.parse(self.run_cli("get", "--id", "pu/a"))["result"]
+        self.assertEqual(rec["peers"], [])
+
+    def test_unpair_removes_both_sides(self):
+        for aid in ("up/a", "up/b"):
+            self.parse(self.run_cli("report", "--id", aid, "--state", "idle"))
+        self.parse(self.run_cli("pair", "--id", "up/a", "--with", "up/b",
+                                "--topic", "t.md"))
+        self.parse(self.run_cli("unpair", "--id", "up/a", "--with", "up/b"))
+        for aid in ("up/a", "up/b"):
+            rec = self.parse(self.run_cli("get", "--id", aid))["result"]
+            self.assertEqual(rec["peers"], [])
+            self.assertEqual(rec["topics"], {})
+
+    def test_remove_drops_the_id_from_its_peers(self):
+        for aid in ("rm/a", "rm/b"):
+            self.parse(self.run_cli("report", "--id", aid, "--state", "idle"))
+        self.parse(self.run_cli("pair", "--id", "rm/a", "--with", "rm/b",
+                                "--topic", "t.md"))
+        self.parse(self.run_cli("remove", "--id", "rm/a"))
+        rec = self.parse(self.run_cli("get", "--id", "rm/b"))["result"]
+        self.assertEqual(rec["peers"], [])
+        self.assertEqual(rec["topics"], {})
+
+    def test_list_shows_peers_column_only_when_someone_has_one(self):
+        self.parse(self.run_cli("report", "--id", "lp/a", "--state", "idle"))
+        self.parse(self.run_cli("report", "--id", "lp/b", "--state", "idle"))
+        proc = self.run_cli("list", "--prefix", "lp/")
+        self.assertNotIn("PEERS", proc.stdout)
+        self.parse(self.run_cli("pair", "--id", "lp/a", "--with", "lp/b",
+                                "--topic", "t.md"))
+        proc = self.run_cli("list", "--prefix", "lp/")
+        self.assertIn("PEERS", proc.stdout.splitlines()[0])
+        self.assertIn("lp/b", proc.stdout)
+
+    def test_send_to_a_non_peer_is_refused(self):
+        self.parse(self.run_cli("report", "--id", "sc/a", "--state", "idle"))
+        self.parse(self.run_cli("report", "--id", "sc/other", "--state", "idle",
+                                "--pane", "%9"))
+        env, log = self.fake_tmux()
+        env["HERDLET_ID"] = "sc/a"
+        proc = self.run_cli("send", "--id", "sc/other", "hello", env_extra=env)
+        self.assertEqual(proc.returncode, 3)
+        self.assertIn("not paired with sc/other; raise it in your report "
+                      "to the master", proc.stderr)
+        self.assertFalse(os.path.exists(log))  # nothing typed anywhere
+
+    def test_send_from_a_caller_with_no_record_says_so(self):
+        # an unregistered caller has no peers either, but the cause is a missing
+        # registration, not a scope decision
+        self.parse(self.run_cli("report", "--id", "nr/a", "--state", "idle"))
+        self.parse(self.run_cli("report", "--id", "nr/b", "--state", "idle",
+                                "--pane", "%9"))
+        self.parse(self.run_cli("remove", "--id", "nr/a"))
+        env, log = self.fake_tmux()
+        env["HERDLET_ID"] = "nr/a"
+        proc = self.run_cli("send", "--id", "nr/b", "hello", env_extra=env)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("no record for nr/a; is the daemon current?", proc.stderr)
+        self.assertFalse(os.path.exists(log))
+
+    def test_send_from_an_unnamed_caller_is_unchanged(self):
+        # the master (or a human in a bare pane) has no HERDLET_ID and no peers
+        self.parse(self.run_cli("report", "--id", "sm/b", "--state", "idle",
+                                "--pane", "%3"))
+        env, log = self.fake_tmux()
+        proc = self.run_cli("send", "--id", "sm/b", "orders", env_extra=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(log) as fh:
+            self.assertIn("send-keys -t %3 -l -- orders", fh.read())
+
+    def test_peer_send_logs_the_thread_and_emits_an_event(self):
+        with tempfile.TemporaryDirectory() as d:
+            topic = os.path.join(d, "loop.md")
+            with open(topic, "w") as fh:
+                fh.write("# Repro loop\n\nthe brief\n")
+            self.parse(self.run_cli("report", "--id", "ps/dev", "--state", "working"))
+            self.parse(self.run_cli("report", "--id", "ps/test", "--state", "idle",
+                                    "--pane", "%8"))
+            self.parse(self.run_cli("pair", "--id", "ps/dev", "--with", "ps/test",
+                                    "--topic", topic))
+
+            conn = socket.socket(socket.AF_UNIX)
+            conn.settimeout(5)
+            conn.connect(self.sock)
+            stream = conn.makefile("rwb")
+            stream.write(b'{"id":"s","method":"subscribe","params":{}}\n')
+            stream.flush()
+            stream.readline()  # subscribed ack
+
+            env, log = self.fake_tmux()
+            env["HERDLET_ID"] = "ps/dev"
+            proc = self.run_cli("send", "--id", "ps/test",
+                                "fixed in abc123,\nplease retest", env_extra=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            event = json.loads(stream.readline())
+            conn.close()
+            self.assertEqual(event, {"type": "peer_send", "from": "ps/dev",
+                                     "to": "ps/test", "topic": topic,
+                                     "chars": len("fixed in abc123,\nplease retest")})
+            with open(log) as fh:
+                self.assertIn("%8", fh.read())
+
+            # a second send adds a line but not a second heading
+            self.run_cli("send", "--id", "ps/test", "and the log?", env_extra=env)
+            with open(topic) as fh:
+                body = fh.read()
+            self.assertEqual(body.count("## Thread"), 1)
+            lines = [l for l in body.splitlines() if l.startswith("- ")]
+            self.assertRegex(
+                lines[0],
+                r"^- \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4} ps/dev -> ps/test: "
+                r"fixed in abc123, please retest$")
+            self.assertTrue(lines[1].endswith("ps/dev -> ps/test: and the log?"))
+            self.assertIn("the brief", body)  # the topic's own content survives
+
+    def test_a_report_never_touches_peers(self):
+        for aid in ("mk/a", "mk/b"):
+            self.parse(self.run_cli("report", "--id", aid, "--state", "idle"))
+        self.parse(self.run_cli("pair", "--id", "mk/a", "--with", "mk/b",
+                                "--topic", "t.md"))
+        self.parse(self.run_cli("report", "--id", "mk/a", "--state", "working",
+                                "--message", "on it"))
+        rec = self.parse(self.run_cli("get", "--id", "mk/a"))["result"]
+        self.assertEqual(rec["peers"], ["mk/b"])
+        self.assertEqual(rec["topics"], {"mk/b": os.path.abspath("t.md")})
+
+    def test_a_peer_send_does_not_wake_a_wait_on_the_master(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.parse(self.run_cli("report", "--id", "nw/master", "--state", "working"))
+            self.parse(self.run_cli("report", "--id", "nw/dev", "--state", "working"))
+            self.parse(self.run_cli("report", "--id", "nw/test", "--state", "idle",
+                                    "--pane", "%8"))
+            self.parse(self.run_cli("pair", "--id", "nw/dev", "--with", "nw/test",
+                                    "--topic", os.path.join(d, "t.md")))
+            env, _ = self.fake_tmux()
+            env["HERDLET_ID"] = "nw/dev"
+            sent = []
+            timer = threading.Timer(0.3, lambda: sent.append(self.run_cli(
+                "send", "--id", "nw/test", "retest please", env_extra=env)))
+            timer.start()
+            proc = self.run_cli("wait", "--id", "nw/master", "--state", "done",
+                                "--timeout", "1")
+            timer.join()
+            self.assertEqual(sent[0].returncode, 0, sent[0].stderr)
+            self.assertEqual(proc.returncode, 2)
+
     def test_periodic_sweep_prunes_over_max_age(self):
         # a long-running daemon GCs records that age past the cap, no restart needed
         with tempfile.TemporaryDirectory() as tmp:
@@ -832,6 +1014,16 @@ class SnapshotTest(unittest.TestCase):
                                 "agent": "claude", "session": None, "cwd": None,
                                 "updated": time.time()}
         self.assertEqual(bus.snapshot("legacy")["compacts"], 0)
+
+    def test_a_record_without_peers_reads_as_unpaired(self):
+        h = _load_module()
+        bus = h.Bus()
+        bus.agents["legacy"] = {"state": "idle", "pane": "%1", "message": None,
+                                "agent": "claude", "session": None, "cwd": None,
+                                "updated": time.time()}
+        snap = bus.snapshot("legacy")
+        self.assertEqual(snap["peers"], [])
+        self.assertEqual(snap["topics"], {})
 
     def test_a_real_count_is_not_overwritten_by_the_default(self):
         h = _load_module()
@@ -1355,6 +1547,52 @@ class SpawnCommandTest(_DaemonCase):
         code, out, err = self.spawn(ready_timeout=0)
         self.assertEqual(err, "")
         self.assertEqual(code, 0)
+
+    def as_spawner(self, spawner="proj/master"):
+        self.h.os.environ["HERDLET_ID"] = spawner
+        self.addCleanup(self.h.os.environ.pop, "HERDLET_ID", None)
+        self.h.call(self.sock, "agent.report",
+                    {"id": spawner, "state": "working", "pane": "%0"})
+        return spawner
+
+    def test_the_spawner_is_linked_downward_to_what_it_spawned(self):
+        # a spawned master is a worker to the scope check, so without the link
+        # it could not `send` to its own children. one-directional: the child
+        # gets no shortcut back into its master's pane
+        spawner = self.as_spawner()
+        brief = os.path.join(self.tmp.name, "b.md")
+        with open(brief, "w") as fh:
+            fh.write("# Do the thing\n")
+        self.spawn(brief=brief)
+        self.assertEqual(self.record(spawner)["peers"], ["proj/dev"])
+        self.assertEqual(self.record(spawner)["topics"], {"proj/dev": brief})
+        self.assertEqual(self.record("proj/dev")["peers"], [])
+        self.assertEqual(self.record("proj/dev")["topics"], {})
+        self.assertEqual(self.h.peer_scope(self.sock, "proj/dev"),
+                         (spawner, brief))
+
+    def test_a_spawned_child_cannot_send_up_to_its_spawner(self):
+        spawner = self.as_spawner()
+        self.spawn()
+        self.h.os.environ["HERDLET_ID"] = "proj/dev"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as exc:
+            self.h.peer_scope(self.sock, spawner)
+        self.assertEqual(exc.exception.code, 3)
+        self.assertIn(f"not paired with {spawner}", err.getvalue())
+
+    def test_a_briefless_spawn_gets_a_default_topic(self):
+        spawner = self.as_spawner()
+        self.spawn(cwd="/tmp")
+        self.assertEqual(self.record(spawner)["topics"],
+                         {"proj/dev": "/tmp/plans/proj-dev-thread.md"})
+
+    def test_an_unregistered_spawner_is_not_paired(self):
+        # a human-launched master has no record and no HERDLET_ID: unrestricted
+        code, out, err = self.spawn()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.record("proj/dev")["peers"], [])
+        self.assertEqual(err.count("herdlet:"), 0)
 
     def test_json_payload(self):
         brief = os.path.join(self.tmp.name, "b.md")

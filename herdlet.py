@@ -25,7 +25,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 
 def _log(*parts):
@@ -112,10 +112,14 @@ class Bus:
         # record untouched past MAX_AGE (see _prunable), so a restart clears the
         # days-dead panes a terminal-only TTL would keep forever.
         now = time.time()
-        self.agents = {
-            aid: rec for aid, rec in self.agents.items()
-            if not self._prunable(rec, now)
-        }
+        kept = {aid: rec for aid, rec in self.agents.items()
+                if not self._prunable(rec, now)}
+        dropped = [aid for aid in self.agents if aid not in kept]
+        self.agents = kept
+        for aid in dropped:
+            self._drop_peer(aid)
+        if dropped:
+            self._save()
         # re-arm the blocked re-announce for any agent restored still blocked, so
         # a daemon restart mid-herd doesn't silence a stuck worker until its next
         # hook (which a blocked agent won't fire until a human acts anyway)
@@ -137,15 +141,18 @@ class Bus:
 
     def snapshot(self, agent_id):
         rec = self.agents.get(agent_id)
-        # compacts defaulted here so a record written by an older daemon still
-        # answers the question `get` is asked
-        return {"id": agent_id, "compacts": 0, **rec} if rec else None
+        # compacts/peers defaulted here so a record written by an older daemon
+        # still answers the questions `get` is asked
+        if not rec:
+            return None
+        return {"id": agent_id, "compacts": 0, "peers": [], "topics": {}, **rec}
 
     def report(self, agent_id, params):
         rec = self.agents.setdefault(agent_id, {
             "state": "unknown", "message": None, "agent": None,
             "pane": None, "cwd": None, "session": None, "transcript": None,
-            "model": None, "effort": None, "compacts": 0, "updated": 0.0,
+            "model": None, "effort": None, "compacts": 0,
+            "peers": [], "topics": {}, "updated": 0.0,
         })
         state = params.get("state") or rec["state"]
         rec["state"] = state
@@ -173,10 +180,60 @@ class Bus:
         if rec is None:
             return None
         self._cancel_reemit(agent_id)
+        self._drop_peer(agent_id)
         self._save()
         event = {"type": "agent.removed", "id": agent_id}
         self._fanout(event, agent_id, None)
         return event
+
+    def pair(self, a, b, topic, oneway=False):
+        for aid in (a, b):
+            if aid not in self.agents:
+                return {"error": {"code": "not_found", "id": aid}}
+        if a == b:
+            return {"error": {"code": "invalid_params"}}
+        self._link(a, b, topic)
+        if not oneway:
+            self._link(b, a, topic)
+        self._save()
+        return {"result": {"type": "paired", "id": a, "with": b, "topic": topic,
+                           "oneway": bool(oneway),
+                           "peers": self.agents[a]["peers"]}}
+
+    def unpair(self, a, b):
+        if a not in self.agents and b not in self.agents:
+            return {"error": {"code": "not_found", "id": a}}
+        for one, other in ((a, b), (b, a)):
+            rec = self.agents.get(one)
+            if rec is None:
+                continue
+            rec["peers"] = [p for p in (rec.get("peers") or []) if p != other]
+            (rec.get("topics") or {}).pop(other, None)
+        self._save()
+        return {"result": {"type": "unpaired", "id": a, "with": b,
+                           "peers": (self.agents.get(a) or {}).get("peers", [])}}
+
+    def peer_send(self, params):
+        # deliberately no record touched and no _wake: the pane carried the
+        # message, so a master waiting on its own state must not be woken
+        event = {"type": "peer_send", "from": params.get("from"),
+                 "to": params.get("to"), "topic": params.get("topic"),
+                 "chars": int(params.get("chars") or 0)}
+        self._fanout(event, event["from"], None)
+        return event
+
+    def _link(self, one, other, topic):
+        rec = self.agents[one]
+        peers = rec.setdefault("peers", [])
+        if other not in peers:
+            peers.append(other)
+        rec.setdefault("topics", {})[other] = topic
+
+    def _drop_peer(self, agent_id):
+        for rec in self.agents.values():
+            if agent_id in (rec.get("peers") or []):
+                rec["peers"] = [p for p in rec["peers"] if p != agent_id]
+            (rec.get("topics") or {}).pop(agent_id, None)
 
     def _fanout(self, event, agent_id, state):
         for queue, id_f, state_f in list(self.subscribers):
@@ -248,6 +305,7 @@ class Bus:
         for aid in drop:
             self._cancel_reemit(aid)
             self.agents.pop(aid, None)
+            self._drop_peer(aid)
             self._fanout({"type": "agent.removed", "id": aid}, aid, None)
         if drop:
             self._save()
@@ -349,6 +407,29 @@ async def _handle_client(reader, writer, bus):
                 else:
                     _log("remove", params.get("id"))
                     _send(writer, {"id": rid, "result": {**event, "type": "removed"}})
+
+            elif method in ("agent.pair", "agent.unpair"):
+                one, other = params.get("id"), params.get("with")
+                if not one or not other:
+                    _send(writer, {"id": rid, "error": {"code": "invalid_params"}})
+                    continue
+                if method == "agent.pair":
+                    if not params.get("topic"):
+                        _send(writer, {"id": rid, "error": {"code": "invalid_params"}})
+                        continue
+                    resp = bus.pair(one, other, params.get("topic"),
+                                    params.get("oneway"))
+                else:
+                    resp = bus.unpair(one, other)
+                if "result" in resp:
+                    _log(method.split(".")[1], one, other)
+                _send(writer, {"id": rid, **resp})
+
+            elif method == "peer.send":
+                event = bus.peer_send(params)
+                _log("peer_send", f"{event['from']} -> {event['to']}",
+                     f"{event['chars']} chars", event["topic"] or "")
+                _send(writer, {"id": rid, "result": event})
 
             elif method == "wait":
                 await _handle_wait(writer, bus, rid, params)
@@ -653,6 +734,35 @@ def cmd_remove(args):
     emit(call_or_die(args.socket, "agent.remove", {"id": agent_id}))
 
 
+def cmd_pair(args):
+    resp = call_or_die(args.socket, "agent.pair", {
+        "id": args.id, "with": args.peer, "topic": os.path.abspath(args.topic)})
+    _die_on_pair_error(resp)
+    emit(resp)
+
+
+def cmd_unpair(args):
+    resp = call_or_die(args.socket, "agent.unpair",
+                       {"id": args.id, "with": args.peer})
+    _die_on_pair_error(resp)
+    emit(resp)
+
+
+def _die_on_pair_error(resp):
+    err = resp.get("error") or {}
+    if err.get("code") == "not_found":
+        die(f"unknown agent '{err.get('id')}' (see: herdlet list)")
+    if err.get("code") == "invalid_params":
+        die("pair takes two different registered ids and a --topic path")
+    if err.get("code") == "unknown_method":
+        die(stale_daemon_note())
+
+
+def stale_daemon_note():
+    return (f"the running daemon has no peer channel (herdlet {__version__} "
+            f"needs its own daemon); restart it: pkill -f 'herdlet.*serve'")
+
+
 def sort_key(rec):
     order = {"blocked": 0, "limited": 1, "stale": 2, "gone": 3, "working": 4,
              "spawning": 5, "done": 6, "ended": 7, "idle": 8}
@@ -720,14 +830,21 @@ def cmd_list(args):
     if not agents:
         print("no agents registered")
         return
-    rows = [("ID", "STATE", "AGE", "AGENT", "MODEL", "PANE", "WHERE", "MESSAGE")]
+    # PEERS only when someone has one, to keep the usual table narrow
+    peers = any(rec.get("peers") for rec in agents)
+    header = ["ID", "STATE", "AGE", "AGENT", "MODEL", "PANE", "WHERE"]
+    rows = [tuple(header + (["PEERS"] if peers else []) + ["MESSAGE"])]
     for rec in agents:
-        rows.append((rec["id"], rec["state"], rec["age"], rec.get("agent") or "-",
-                     model_cell(rec), rec.get("pane") or "-", rec["where"],
-                     rec.get("message") or ""))
-    widths = [max(len(row[i]) for row in rows) for i in range(7)]
+        cells = [rec["id"], rec["state"], rec["age"], rec.get("agent") or "-",
+                 model_cell(rec), rec.get("pane") or "-", rec["where"]]
+        if peers:
+            cells.append(",".join(rec.get("peers") or []) or "-")
+        rows.append(tuple(cells + [rec.get("message") or ""]))
+    last = len(rows[0]) - 1
+    widths = [max(len(row[i]) for row in rows) for i in range(last)]
     for row in rows:
-        print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row[:7])) + "  " + row[7])
+        print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row[:last]))
+              + "  " + row[last])
 
 
 def timeout_as_result(resp):
@@ -1056,6 +1173,76 @@ def send_text(pane, text, no_enter=False):
         tmux("send-keys", "-t", pane, "Enter", check=True)
 
 
+THREAD_HEADING = "## Thread"
+
+
+def thread_line(from_id, to_id, text):
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    return f"- {stamp} {from_id} -> {to_id}: {squash(text)}"
+
+
+def append_thread(path, line):
+    """One line under `## Thread`, heading created once. Returns an error note."""
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a+") as fh:
+            fh.seek(0)
+            body = fh.read()
+            out = []
+            if body and not body.endswith("\n"):
+                out.append("\n")
+            if not any(l.strip() == THREAD_HEADING for l in body.splitlines()):
+                out.append(f"\n{THREAD_HEADING}\n\n" if body else f"{THREAD_HEADING}\n\n")
+            out.append(line + "\n")
+            fh.write("".join(out))
+    except OSError as exc:
+        return f"sent, but could not log it to {path}: {exc}"
+    return None
+
+
+def peer_scope(sock_path, target):
+    """(caller id, topic) for a worker's peer send; (None, None) for the master.
+
+    A worker may only reach a peer the master paired it with; everything else
+    belongs in its report, not in a side channel.
+    """
+    caller = os.environ.get("HERDLET_ID")
+    if not caller:
+        return None, None
+    resp = call_or_die(sock_path, "agent.get", {"id": caller})
+    err = resp.get("error") or {}
+    if err.get("code") == "not_found":
+        # no record means no peers, but the cause is a missing registration or a
+        # daemon restart, not a scope decision; say which
+        die(f"no record for {caller}; is the daemon current?")
+    rec = resp.get("result") or {}
+    if "peers" not in rec:
+        die(stale_daemon_note())  # a current daemon always defaults the key
+    if target not in (rec.get("peers") or []):
+        print(f"herdlet: not paired with {target}; "
+              f"raise it in your report to the master", file=sys.stderr)
+        sys.exit(3)
+    return caller, (rec.get("topics") or {}).get(target)
+
+
+def record_peer_send(sock_path, from_id, to_id, topic, text):
+    if topic:
+        note = append_thread(topic, thread_line(from_id, to_id, text))
+        if note:
+            print(f"herdlet: {note}", file=sys.stderr)
+    try:
+        resp = call(sock_path, "peer.send", {"from": from_id, "to": to_id,
+                                             "topic": topic, "chars": len(text)},
+                    timeout=1.0)
+    except (OSError, ValueError):
+        return  # the message is already in the pane; the event is a nicety
+    if (resp.get("error") or {}).get("code") == "unknown_method":
+        print(f"herdlet: sent, but no peer_send event: {stale_daemon_note()}",
+              file=sys.stderr)
+
+
 def cmd_send(args):
     if args.text and args.file:
         die("pass either positional text or --file PATH ('-' for stdin), not both")
@@ -1072,7 +1259,10 @@ def cmd_send(args):
     if not text:
         die(f"nothing to send: {args.file} is empty" if args.file
             else "nothing to send: the message is empty")
+    from_id, topic = peer_scope(args.socket, args.id)
     send_text(resolve_pane(args.socket, args.id), text, args.no_enter)
+    if from_id:
+        record_peer_send(args.socket, from_id, args.id, topic, text)
 
 
 def transcript_messages(path, count):
@@ -1208,6 +1398,7 @@ def cmd_spawn(args):
     if not spawn_ready(args.socket, args.id, pane):
         params["state"] = "spawning"  # else a hook beat us here; don't undo it
     call_or_die(args.socket, "agent.report", params)
+    pair_with_spawner(args.socket, args.id, brief, cwd)
 
     if args.ready_timeout > 0:
         call_or_die(args.socket, "wait", {
@@ -1242,6 +1433,29 @@ def cmd_spawn(args):
               f"pane {pane} is alive, peek/approve it by pane id{brief_note}",
               file=sys.stderr)
     return 0
+
+
+def spawn_topic(agent_id, cwd):
+    return os.path.join(cwd, "plans", f"{agent_id.replace('/', '-')}-thread.md")
+
+
+def pair_with_spawner(sock_path, agent_id, brief, cwd):
+    """You may talk to what you spawned - downward only.
+
+    A nested master is a worker to the scope check (spawn gives it a
+    HERDLET_ID), so without this its own children would be out of reach. The
+    link is one-directional on purpose: a child must not get a shortcut into
+    its master's pane. Best effort - an unregistered spawner has no HERDLET_ID
+    either, so it is unrestricted anyway.
+    """
+    spawner = default_id()
+    if not spawner or spawner == agent_id:
+        return None
+    topic = brief or spawn_topic(agent_id, cwd)
+    resp = call_or_die(sock_path, "agent.pair",
+                       {"id": spawner, "with": agent_id, "topic": topic,
+                        "oneway": True})
+    return topic if "result" in resp else None
 
 
 def spawn_ready(sock_path, agent_id, pane):
@@ -1539,6 +1753,18 @@ def main():
     p.add_argument("--here", action="store_true", help="only agents in the current tmux session")
     p.add_argument("--prefix", help="only ids starting with this prefix, e.g. myproject/")
     p.set_defaults(fn=cmd_list)
+
+    p = sub.add_parser("pair", help="let two agents talk to each other directly, on one topic")
+    p.add_argument("--id", required=True, help="one agent id")
+    p.add_argument("--with", dest="peer", required=True, help="the other agent id")
+    p.add_argument("--topic", required=True,
+                   help="topic file the exchange is logged to (the master reads it later)")
+    p.set_defaults(fn=cmd_pair)
+
+    p = sub.add_parser("unpair", help="remove a peer link from both agents")
+    p.add_argument("--id", required=True)
+    p.add_argument("--with", dest="peer", required=True)
+    p.set_defaults(fn=cmd_unpair)
 
     p = sub.add_parser("remove", help="remove an agent from the registry")
     p.add_argument("--id", help="agent id (default: $HERDLET_ID or $TMUX_PANE)")

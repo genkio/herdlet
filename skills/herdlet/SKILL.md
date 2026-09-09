@@ -186,6 +186,12 @@ the text is typed into that agent's terminal and submitted with Enter, as if
 its human had typed it. if the target agent is mid-turn, the message queues
 like normal user input. use `--no-enter` to type without submitting.
 
+if YOU are a worker (`$HERDLET_ID` is set), `send` only reaches your peers - the
+agents the master paired you with, plus any worker you spawned yourself.
+anything else exits 3 with `not paired with <target>; raise it in your report to
+the master`. that is the answer, not an obstacle - put it in your report. see
+"talk to a peer directly".
+
 anything multi-line or over 200 characters is delivered as one bracketed paste,
 so embedded newlines read as text instead of submitting early and a long message
 cannot be cut in half by the Enter that follows it. pass a long brief with
@@ -193,6 +199,53 @@ cannot be cut in half by the Enter that follows it. pass a long brief with
 argv-length ceiling. still prefer a brief FILE on disk plus a one-line
 "read X and do it" for anything really big - it costs the worker one Read
 instead of a wall of pasted text.
+
+## talk to a peer directly
+
+normally every worker-to-worker exchange goes through the master, and each hop
+costs the most expensive agent in the herd a full turn. two loops don't need it:
+implementer <-> tester (repro steps, "fixed, retest", which log line to read)
+and reviewer <-> implementer (minor findings, "intentional, here is why"). a
+master opens that channel:
+
+```bash
+herdlet pair --id proj/dev --with proj/tester --topic plans/repro.md
+herdlet unpair --id proj/dev --with proj/tester
+```
+
+the link is symmetric - both records gain the other in `peers`, with the topic
+file in `topics` (`herdlet get`, and a `PEERS` column in `list` once anyone has
+one). both agents must already be registered. an agent can have several peers.
+tell each of them so, in the brief:
+
+> You are paired with `<id>` on `<topic>`. Send it repros and answers directly
+> with `herdlet send --id <id> ...`. Do not copy the master. Decisions about
+> scope, interface or money go in your report, not to your peer.
+
+as a worker, `send` is scoped to your peers: a send to anyone else exits 3. that
+is a guardrail to keep the default path honest, not an isolation boundary -
+`HERDLET_ID= herdlet send`, `approve` and `resume` all still reach any pane, so
+treat the refusal as the reminder it is rather than something to route around.
+the split it enforces: mechanical back-and-forth goes sideways to your peer,
+everything about scope, interfaces, money or risk goes UP in your report.
+
+you may also talk to what you SPAWNED: `spawn` links you to each worker it
+creates (topic = its `--brief`, else `<cwd>/plans/<id with / as ->-thread.md`),
+so a nested master can drive its own children even though spawn gave it a
+`HERDLET_ID`. that link is one-directional - only YOUR record gains the child.
+a child cannot `send` up into its spawner: it reports upward like any other
+worker, and only an explicit `herdlet pair` is symmetric.
+
+a peer send touches no record, so a wait on the MASTER's own state is never
+woken by it. the receiving peer still transitions through its own hooks, so a
+master waiting on that peer's `done` wakes as usual.
+
+each peer send appends one line to the topic file (`- <timestamp> <from> ->
+<to>: <first 120 chars>`) under a `## Thread` heading. the full text went to
+the pane, so the file is the audit trail the master reads later, not a
+mailbox - never poll it for replies, and never treat it as a place
+to hold a conversation. read your peer's actual answer with
+`peek --transcript`, or just wait for it to `send` you one. the daemon also emits a `peer_send` event on `watch`.
 
 ## spawn a worker agent
 
@@ -224,6 +277,8 @@ herdlet spawn --id proj/dev --model sonnet --effort medium --brief plans/dev.md
   in a new directory can be on a trust prompt - then `send` the brief yourself.
   exit 1 = the pane is already gone, so the launch command itself failed; check
   the model and effort you passed.
+- spawn also links you to the worker (one way, downward), so you can `send` to
+  it even when you are yourself a spawned agent (see "talk to a peer directly").
 - the record exists from t=0 in state `spawning`, so the worker is addressable
   by NAME immediately, including for the trust prompt above. no pane-id-only
   window any more.
@@ -374,6 +429,9 @@ then loop: `send` a role its task, one long `wait --state done,blocked,limited`
 on all roles at once (`--id a,b` or `--prefix proj/`), `peek` for the outcome,
 pass results to the next role, report to the user.
 relay `peek` summaries, not whole transcripts, to keep your own context small.
+`pair` the implementer with its tester or reviewer (see "talk to a peer
+directly") so their mechanical rounds stop costing you a turn each; you still
+read the outcome in the topic file and in their reports.
 after collecting a worker's result, `herdlet ack --id <worker>` clears it from
 the inbox: a `done` (still-alive) worker flips back to `idle`, an `ended` (dead)
 one is removed. then `list` reads as an inbox of live work.
