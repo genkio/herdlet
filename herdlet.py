@@ -1259,6 +1259,31 @@ def cmd_setup(args):
     return 0
 
 
+def hook_call(sock_path, method, params):
+    """One hook RPC: retry once, then log the loss instead of vanishing.
+
+    A dropped report leaves the agent stuck in its previous state and every
+    waiter on it running to timeout, so a failure is recorded in the daemon
+    log even though the hook itself must stay silent and exit 0.
+    """
+    last = None
+    for timeout in (1.0, 2.0):
+        try:
+            return call(sock_path, method, params, timeout=timeout)
+        except (OSError, ValueError) as exc:
+            last = exc
+    _log_file(f"hook dropped {method} for {params.get('id')}: {last}")
+    return None
+
+
+def _log_file(message):
+    try:
+        with open(LOG_PATH, "a") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+    except OSError:
+        pass
+
+
 def cmd_hook(args):
     # fired from agent hook chains: never block, never fail, never print
     if os.environ.get("HERDLET_SKIP"):
@@ -1286,21 +1311,23 @@ def cmd_hook(args):
             if data.get("session_id"):
                 params["session"] = squash(str(data["session_id"]), 200)
             if not ensure_daemon(args.socket):
+                _log_file(f"hook: daemon unavailable on {args.socket}")
                 return 0
-            call(args.socket, "agent.report", params, timeout=1.0)
+            hook_call(args.socket, "agent.report", params)
             return 0
 
         if event == "PreCompact":
             if not ensure_daemon(args.socket):
+                _log_file(f"hook: daemon unavailable on {args.socket}")
                 return 0
             # a compaction alone says nothing about state, so an id with no
             # record yet must not be registered as `unknown`
-            if "result" not in call(args.socket, "agent.get",
-                                    {"id": agent_id}, timeout=1.0):
+            resp = hook_call(args.socket, "agent.get", {"id": agent_id})
+            if resp is None or "result" not in resp:
                 return 0
-            call(args.socket, "agent.report",
-                 {"id": agent_id, "agent": args.agent, "compact": True,
-                  "pane": os.environ.get("TMUX_PANE")}, timeout=1.0)
+            hook_call(args.socket, "agent.report",
+                      {"id": agent_id, "agent": args.agent, "compact": True,
+                       "pane": os.environ.get("TMUX_PANE")})
             return 0
 
         state = HOOK_STATES.get(event)
@@ -1326,8 +1353,9 @@ def cmd_hook(args):
             params["message"] = ""  # a starting/finished turn shows no stale "doing" text
 
         if not ensure_daemon(args.socket):
+            _log_file(f"hook: daemon unavailable on {args.socket}")
             return 0
-        call(args.socket, "agent.report", params, timeout=1.0)
+        hook_call(args.socket, "agent.report", params)
     except Exception:
         pass
     return 0

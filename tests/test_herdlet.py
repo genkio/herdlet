@@ -2749,6 +2749,60 @@ class WaitPinningTest(_DaemonCase):
         self.assertEqual(result["proc"].returncode, 2, result["proc"].stdout)
 
 
+class HookCallTest(unittest.TestCase):
+    """A hook RPC is retried, then logged, never printed."""
+
+    def setUp(self):
+        self.h = _load_module()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.h.LOG_PATH = os.path.join(self.tmp.name, "herdlet.log")
+
+    def test_a_transient_failure_is_retried(self):
+        attempts = []
+
+        def flaky(sock, method, params, timeout=5.0):
+            attempts.append(method)
+            if len(attempts) == 1:
+                raise ConnectionResetError("busy")
+            return {"result": {"type": "reported"}}
+
+        self.h.call = flaky
+        resp = self.h.hook_call("s.sock", "agent.report", {"id": "x"})
+        self.assertEqual(resp["result"]["type"], "reported")
+        self.assertEqual(attempts, ["agent.report", "agent.report"])
+
+    def test_exhausted_retries_are_logged_and_stay_silent(self):
+        def down(sock, method, params, timeout=5.0):
+            raise ConnectionRefusedError("down")
+
+        self.h.call = down
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            resp = self.h.hook_call("s.sock", "agent.report", {"id": "x"})
+        self.assertIsNone(resp)
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(err.getvalue(), "")
+        with open(self.h.LOG_PATH) as fh:
+            self.assertIn("hook dropped agent.report for x", fh.read())
+
+    def test_a_hook_without_a_daemon_logs_the_failure(self):
+        self.h.ensure_daemon = lambda sock: False
+        saved = self.h.sys.stdin
+        self.h.sys.stdin = io.StringIO("")
+        try:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                code = self.h.cmd_hook(_Args(socket="s.sock", agent="claude",
+                                             event="Stop", id="x"))
+        finally:
+            self.h.sys.stdin = saved
+        self.assertEqual(code, 0)
+        self.assertEqual(err.getvalue(), "")
+        with open(self.h.LOG_PATH) as fh:
+            self.assertIn("daemon unavailable on s.sock", fh.read())
+
+
 class DaemonElectionTest(unittest.TestCase):
     """Auto-start must elect exactly one daemon per socket.
 
