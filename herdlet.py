@@ -1404,6 +1404,17 @@ def wait_for_empty_input(pane, settle):
         time.sleep(min(SEND_POLL_INTERVAL, remaining))
 
 
+def pane_is_shell(pane):
+    """Is this pane sitting at a bare shell prompt?
+
+    A shell has no TUI input box for the verifier to find, so `send` would
+    otherwise refuse it with exit 6. Typing a line into a shell is exactly
+    what the caller asked for, so it falls back to the unverified path.
+    """
+    return (tmux("display-message", "-p", "-t", pane,
+                 "#{pane_current_command}") or "").strip() in SHELLS
+
+
 def send_lock(sock_path, pane):
     state_dir = sock_path + ".state.d"
     os.makedirs(state_dir, mode=0o700, exist_ok=True)
@@ -1577,13 +1588,19 @@ def cmd_send(args):
 
             result = verified_send(pane, text, args.settle, baseline)
             verified = result == "sent"
-            if result == "no-input":
+            if result == "no-input" and pane_is_shell(pane):
+                # a bare shell has no input box to detect; type the line
+                send_text(pane, text, args.no_enter)
+                verified = False
+                print(f"herdlet: {args.id} is at a shell; sent unverified",
+                      file=sys.stderr)
+            elif result == "no-input":
                 print(f"herdlet: no input box on {args.id}; nothing typed",
                       file=sys.stderr)
                 for line in pane_tail(capture_pane(pane)):
                     print(line, file=sys.stderr)
                 return EXIT_NO_INPUT
-            if result == "draft":
+            elif result == "draft":
                 print(f"herdlet: {args.id} still holds unsubmitted text; "
                       "nothing typed", file=sys.stderr)
                 return EXIT_SEND

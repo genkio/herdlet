@@ -1726,6 +1726,7 @@ class SendCommandTest(unittest.TestCase):
         self.h.send_record = lambda socket, agent_id: self.record
         self.h.resolve_pane = lambda socket, agent_id: "%4"
         self.h.peer_scope = lambda socket, agent_id: (None, None)
+        self.h.pane_is_shell = lambda pane: False
 
     def args(self, **kw):
         base = dict(socket=os.path.join(self.tmp.name, "h.sock"), id="%4",
@@ -1778,6 +1779,30 @@ class SendCommandTest(unittest.TestCase):
         self.assertEqual(code, 6)
         self.assertIn("no input box on %4; nothing typed", err.getvalue())
         self.assertIn("Press enter to confirm or esc to cancel", err.getvalue())
+
+    def test_shell_pane_falls_back_to_an_unverified_send(self):
+        self.h.verified_send = lambda pane, text, settle, before: "no-input"
+        self.h.pane_is_shell = lambda pane: True
+        sent = []
+        self.h.send_text = lambda pane, text, no_enter: sent.append(
+            (pane, text, no_enter))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = self.h.cmd_send(self.args())
+        self.assertEqual(code, 0)
+        self.assertEqual(sent, [("%4", "hello", False)])
+        self.assertIn("is at a shell; sent unverified", err.getvalue())
+
+    def test_a_tui_without_an_input_box_still_exits_six(self):
+        self.h.verified_send = lambda pane, text, settle, before: "no-input"
+        self.h.pane_is_shell = lambda pane: False
+        sent = []
+        self.h.send_text = lambda pane, text, no_enter: sent.append(pane)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = self.h.cmd_send(self.args())
+        self.assertEqual(code, 6)
+        self.assertEqual(sent, [])
 
     def test_no_verify_uses_the_old_send_path(self):
         sent = []

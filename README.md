@@ -137,7 +137,10 @@ agent by launching it with an env var: `HERDLET_ID=builder claude`.
 
 `send` serializes messages for each target pane. It waits up to five seconds for
 existing input to clear before it types. If the input stays, it exits 4 and types
-nothing. If no input box is visible, it exits 6 and shows the pane tail.
+nothing. If no input box is visible, it exits 6 and shows the pane tail - except
+in a pane sitting at a bare shell, where there is nothing to detect: there the
+text is typed unverified (a note goes to stderr), so `send` can drive plain
+shells and one-shot commands without `--no-verify`.
 
 After Enter, `send` makes sure that the input box is empty. It sends Enter one
 more time if the text remains. If the second attempt fails, `send` exits 4 and
