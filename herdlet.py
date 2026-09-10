@@ -167,7 +167,8 @@ class Bus:
             rec["compacts"] = int(rec.get("compacts") or 0) + 1
         rec["updated"] = round(time.time(), 3)
         self._save()
-        event = {"type": "agent.state_changed", **self.snapshot(agent_id)}
+        event_type = "compacted" if params.get("compact") else "agent.state_changed"
+        event = {"type": event_type, **self.snapshot(agent_id)}
         self._fanout(event, agent_id, state)
         self._wake(agent_id, state, event)
         if state == "blocked":
@@ -249,7 +250,7 @@ class Bus:
         for predicate, fut in self.waiters:
             if fut.done():
                 continue
-            if predicate(agent_id, state):
+            if predicate(agent_id, state, event):
                 fut.set_result(event)
             else:
                 remaining.append((predicate, fut))
@@ -455,7 +456,8 @@ async def _handle_wait(writer, bus, rid, params):
     ids = params.get("ids") or ([params["id"]] if params.get("id") else [])
     prefix = params.get("prefix")
     states = params.get("states") or ([params["state"]] if params.get("state") else None)
-    if (not ids and not prefix) or not states:
+    on_compact = bool(params.get("on_compact"))
+    if (not ids and not prefix) or (not states and not on_compact):
         _send(writer, {"id": rid, "error": {"code": "invalid_params"}})
         return
 
@@ -466,7 +468,7 @@ async def _handle_wait(writer, bus, rid, params):
         # every currently-matching agent already in a target state, so a herd
         # wait can batch-collect them instead of re-issuing the wait per straggler
         return [bus.snapshot(a) for a in bus.agents
-                if matches(a) and bus.agents[a]["state"] in states]
+                if states and matches(a) and bus.agents[a]["state"] in states]
 
     if not params.get("edge"):
         ready = matched_now()
@@ -476,13 +478,17 @@ async def _handle_wait(writer, bus, rid, params):
             return
 
     fut = asyncio.get_running_loop().create_future()
-    entry = (lambda i, s: matches(i) and s in states, fut)
+    entry = (lambda i, s, e: matches(i) and (
+        (states and s in states) or (on_compact and e.get("type") == "compacted")), fut)
     bus.waiters.append(entry)
     timeout = params.get("timeout_ms")
     try:
         event = await asyncio.wait_for(fut, timeout / 1000.0 if timeout else None)
-        _send(writer, {"id": rid, "result": {
-            **event, "type": "waited", "already": False, "matched": matched_now()}})
+        result_type = "compacted" if event.get("type") == "compacted" else "waited"
+        result = {**event, "type": result_type, "already": False}
+        if result_type == "waited":
+            result["matched"] = matched_now()
+        _send(writer, {"id": rid, "result": result})
     except asyncio.TimeoutError:
         _send(writer, {"id": rid, "error": {"code": "timeout", "agents": ids,
                                             "prefix": prefix, "states": states}})
@@ -728,10 +734,37 @@ def cmd_get(args):
     emit(call_or_die(args.socket, "agent.get", {"id": args.id or default_id()}))
 
 
+def pane_kill_allowed(rec, command):
+    return rec.get("state") in ("done", "ended") or command in SHELLS
+
+
+def kill_record_pane(agent_id, rec):
+    pane = rec.get("pane")
+    if not pane:
+        print(f"{agent_id}: no pane to kill", file=sys.stderr)
+        return False
+    status = (tmux("display-message", "-p", "-t", pane,
+                   "#{pane_id}\t#{pane_current_command}") or "").strip()
+    if not status:
+        print(f"{agent_id}: pane {pane} is gone", file=sys.stderr)
+        return False
+    current = (status.split("\t", 1) + [""])[:2][1]
+    if not pane_kill_allowed(rec, current):
+        print(f"{agent_id}: pane {pane} still runs {current}; not killed",
+              file=sys.stderr)
+        return False
+    tmux("kill-pane", "-t", pane, check=True)
+    print(f"{agent_id}: killed pane {pane}")
+    return True
+
+
 def cmd_remove(args):
     agent_id = args.id or default_id()
     if not agent_id:
         die("no agent id: pass --id, or set HERDLET_ID, or run inside tmux")
+    rec = call_or_die(args.socket, "agent.get", {"id": agent_id}).get("result")
+    if args.kill_pane and rec:
+        kill_record_pane(agent_id, rec)
     emit(call_or_die(args.socket, "agent.remove", {"id": agent_id}))
 
 
@@ -821,6 +854,12 @@ def model_cell(rec):
     return "/".join(p for p in parts if p)
 
 
+def state_cell(rec):
+    state = rec["state"]
+    compacts = int(rec.get("compacts") or 0)
+    return f"{state} C{compacts}" if compacts else state
+
+
 def cmd_list(args):
     resp = call_or_die(args.socket, "agent.list", {})
     agents = annotate(resp.get("result", {}).get("agents", []), pane_map())
@@ -836,7 +875,7 @@ def cmd_list(args):
     header = ["ID", "STATE", "AGE", "AGENT", "MODEL", "PANE", "WHERE"]
     rows = [tuple(header + (["PEERS"] if peers else []) + ["MESSAGE"])]
     for rec in agents:
-        cells = [rec["id"], rec["state"], rec["age"], rec.get("agent") or "-",
+        cells = [rec["id"], state_cell(rec), rec["age"], rec.get("agent") or "-",
                  model_cell(rec), rec.get("pane") or "-", rec["where"]]
         if peers:
             cells.append(",".join(rec.get("peers") or []) or "-")
@@ -899,11 +938,13 @@ def cmd_wait(args):
         die("pass --id (comma-separated waits on whichever transitions first) and/or --prefix")
     if args.edge and args.match:
         die("--edge is meaningless with --match: a match poll never checks stored state")
+    if args.on_compact and args.match:
+        die("--on-compact and --match are mutually exclusive")
     if args.match:
         return wait_for_match(args, ids)
-    if not args.state:
-        die("pass --state (or --match to wait on pane output)")
-    states = [s.strip() for s in args.state.split(",") if s.strip()]
+    if not args.state and not args.on_compact:
+        die("pass --state, --on-compact, or --match")
+    states = [s.strip() for s in (args.state or "").split(",") if s.strip()]
     params = {"states": states}
     if len(ids) == 1 and not args.prefix:
         params["id"] = ids[0]  # single-id shape, keeps pre-0.3 daemons working
@@ -914,6 +955,8 @@ def cmd_wait(args):
             params["prefix"] = args.prefix
     if args.edge:
         params["edge"] = True  # only send when set, so older daemons still work
+    if args.on_compact:
+        params["on_compact"] = True
     if args.timeout:
         params["timeout_ms"] = int(args.timeout * 1000)
     client_timeout = args.timeout + 5 if args.timeout else None
@@ -1511,14 +1554,83 @@ def spawn_line(agent_id, model, effort, title, permission_mode,
     return " ".join(parts)
 
 
-def spawn_split_argv(pane, cwd, line, vertical=False):
-    return ("split-window", "-d", "-v" if vertical else "-h", "-P", "-F",
-            "#{pane_id}", "-t", pane, "-c", cwd, line)
+SPAWN_PANE_FORMAT = ("#{pane_id}\t#{pane_left}\t#{pane_top}\t#{pane_width}"
+                     "\t#{pane_height}\t#{window_width}")
+
+
+def spawn_panes(output):
+    panes = []
+    for line in output.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 6:
+            continue
+        try:
+            pane, left, top, width, height, window_width = fields
+            panes.append({"pane": pane, "left": int(left), "top": int(top),
+                          "width": int(width), "height": int(height),
+                          "window_width": int(window_width)})
+        except ValueError:
+            continue
+    return panes
+
+
+def spawn_target(caller, panes, min_height, vertical=False):
+    if vertical:
+        return caller, "-v", None
+    current = next((pane for pane in panes if pane["pane"] == caller), None)
+    if current is None or current["window_width"] < 160:
+        return None
+    minimum_width = (current["window_width"] + 1) // 2
+    if current["width"] < minimum_width:
+        return None
+    right = [pane for pane in panes
+             if pane["pane"] != caller and pane["left"] > current["left"]]
+    if not right:
+        if len(panes) != 1:
+            return None
+        if current["height"] < min_height:
+            return None
+        worker_width = max(1, current["window_width"] - minimum_width - 1)
+        return caller, "-h", worker_width
+    stack_top = min(pane["top"] for pane in right)
+    stack_bottom = max(pane["top"] + pane["height"] for pane in right)
+    worker_count = len(right) + 1
+    height = (stack_bottom - stack_top - worker_count + 1) // worker_count
+    if height < min_height:
+        return None
+    bottom = max(right, key=lambda pane: (pane["top"], pane["left"]))
+    return bottom["pane"], "-v", None
+
+
+def spawn_split_argv(pane, cwd, line, direction="-h", size=None):
+    args = ["split-window", "-d", direction, "-P", "-F", "#{pane_id}"]
+    if size is not None:
+        args += ["-l", str(size)]
+    return tuple(args + ["-t", pane, "-c", cwd, line])
 
 
 def spawn_window_argv(session, agent_id, cwd, line):
     return ("new-window", "-d", "-P", "-F", "#{pane_id}", "-t", session,
             "-n", agent_id, "-c", cwd, line)
+
+
+def balance_right_stack(caller):
+    output = tmux("list-panes", "-t", caller, "-F", SPAWN_PANE_FORMAT,
+                  check=True) or ""
+    panes = spawn_panes(output)
+    current = next((pane for pane in panes if pane["pane"] == caller), None)
+    if current is None:
+        return
+    right = sorted((pane for pane in panes
+                    if pane["pane"] != caller and pane["left"] > current["left"]),
+                   key=lambda pane: pane["top"])
+    if not right:
+        return
+    total = sum(pane["height"] for pane in right)
+    height, extra = divmod(total, len(right))
+    desired = [height + (index < extra) for index in range(len(right))]
+    for pane, pane_height in zip(right[:-1], desired[:-1]):
+        tmux("resize-pane", "-t", pane["pane"], "-y", str(pane_height), check=True)
 
 
 def allow_prefixes(values):
@@ -1611,6 +1723,8 @@ def write_spawn_allowlist(agent, cwd, values):
 def cmd_spawn(args):
     if args.agent not in ("claude", "codex"):
         die("spawn supports claude and codex only; launch other agents by hand (see README)")
+    if args.min_height < 1:
+        die("--min-height must be one or more")
     sandbox = getattr(args, "sandbox", None)
     approval = getattr(args, "approval", None)
     permission_mode = getattr(args, "permission_mode", None)
@@ -1636,19 +1750,31 @@ def cmd_spawn(args):
                       args.program_args or (), sandbox, approval)
 
     fallback = None
-    out = tmux_run(*spawn_split_argv(caller, cwd, line, args.vertical), timeout=15)
-    if out is None:
-        die("tmux not available")
-    if out.returncode != 0:
-        if "no space" not in out.stderr.lower():
+    placement = "right-stack"
+    pane_output = tmux("list-panes", "-t", caller, "-F", SPAWN_PANE_FORMAT,
+                       check=True) or ""
+    target = spawn_target(caller, spawn_panes(pane_output), args.min_height,
+                          args.vertical)
+    out = None
+    if target is not None:
+        target_pane, direction, size = target
+        out = tmux_run(*spawn_split_argv(target_pane, cwd, line, direction, size),
+                       timeout=15)
+        if out is None:
+            die("tmux not available")
+        if out.returncode != 0 and "no space" not in out.stderr.lower():
             die(f"tmux split-window: {out.stderr.strip()}")
+    if target is None or out.returncode != 0:
         session = (tmux("display-message", "-p", "-t", caller,
                         "#{session_name}", check=True) or "").strip()
         fallback = f"window full, opened a new window in session {session}"
+        placement = "new-window"
         out = tmux_run(*spawn_window_argv(session, args.id, cwd, line), timeout=15)
         if out is None or out.returncode != 0:
             die(f"tmux new-window: {(out.stderr if out else '').strip()}")
     pane = out.stdout.strip()
+    if placement == "right-stack" and not args.vertical:
+        balance_right_stack(caller)
 
     # register before the worker's first hook: until then it has no record at
     # all, so a trust/onboarding prompt is only addressable by raw pane id
@@ -1681,7 +1807,8 @@ def cmd_spawn(args):
         print(json.dumps({"result": {
             "type": "spawned", "id": args.id, "pane": pane, "model": args.model,
             "effort": args.effort, "title": title, "cwd": cwd, "ready": ready,
-            "brief_sent": bool(ready and brief), "note": fallback}}, indent=2))
+            "brief_sent": bool(ready and brief), "note": fallback,
+            "placement": placement}}, indent=2))
     else:
         if fallback:
             print(fallback)
@@ -1758,6 +1885,18 @@ def wait_for_codex_prompt(pane, timeout):
         time.sleep(min(0.1, remaining))
 
 
+def pane_has_menu(capture):
+    if codex_trust_prompt(capture):
+        return True
+    choices = re.findall(r"^\s*[❯›>]?\s*\d+\.\s+\S", capture, re.M)
+    controls = re.search(r"(?:esc to cancel|enter to confirm|\(esc\))", capture, re.I)
+    return len(choices) >= 2 and bool(controls)
+
+
+def pane_tail(capture, lines=5):
+    return [line.strip() for line in capture.splitlines() if line.strip()][-lines:]
+
+
 def cmd_ack(args):
     ids = [s.strip() for s in args.id.split(",") if s.strip()]
     missing = 0
@@ -1771,12 +1910,18 @@ def cmd_ack(args):
         if rec["state"] == "done":
             call_or_die(args.socket, "agent.report", {"id": agent_id, "state": "idle"})
             print(f"{agent_id}: done -> idle")
+            if args.kill_pane:
+                kill_record_pane(agent_id, rec)
         elif rec["state"] == "ended":
             # dead + collected: clear it so `list` stays an inbox of live work
+            if args.kill_pane:
+                kill_record_pane(agent_id, rec)
             call_or_die(args.socket, "agent.remove", {"id": agent_id})
             print(f"{agent_id}: ended -> removed")
         else:
             print(f"{agent_id}: {rec['state']} (nothing to ack)")
+            if args.kill_pane:
+                kill_record_pane(agent_id, rec)
     return 1 if missing else 0
 
 
@@ -1811,6 +1956,19 @@ def cmd_approve(args):
     if not (len(args.option) == 1 and args.option.isdigit()):
         die("--option must be a single digit menu key")
     pane = resolve_pane(args.socket, args.id)
+    capture = tmux("capture-pane", "-p", "-J", "-t", pane, check=True) or ""
+    if not pane_has_menu(capture):
+        try:
+            record = call(args.socket, "agent.get", {"id": args.id}).get("result")
+            if record and record.get("state") == "blocked":
+                call(args.socket, "agent.report",
+                     {"id": args.id, "state": "working", "message": ""}, timeout=1.0)
+        except OSError:
+            pass
+        print(f"herdlet: no menu on {args.id}; nothing typed", file=sys.stderr)
+        for line in pane_tail(capture):
+            print(line, file=sys.stderr)
+        return 5
     tmux("send-keys", "-t", pane, args.option, check=True)  # bare keypress: menus react without Enter
     report_failed = False
     try:
@@ -2060,6 +2218,8 @@ def main():
 
     p = sub.add_parser("remove", help="remove an agent from the registry")
     p.add_argument("--id", help="agent id (default: $HERDLET_ID or $TMUX_PANE)")
+    p.add_argument("--kill-pane", action="store_true",
+                   help="also kill a finished agent pane or a pane at a shell")
     p.set_defaults(fn=cmd_remove)
 
     p = sub.add_parser("wait", help="block until an agent reaches a state, or its pane output matches")
@@ -2072,6 +2232,8 @@ def main():
     p.add_argument("--edge", action="store_true",
                    help="ignore the current state; wake only on a fresh report "
                         "(use right after answering a menu, to avoid matching the stale state)")
+    p.add_argument("--on-compact", action="store_true",
+                   help="also wake on the target's next context compaction")
     p.add_argument("--timeout-ok", action="store_true",
                    help="a timeout is a result, not an error: exit 0 with "
                         "result.type 'timeout' (for harnesses that read a "
@@ -2134,6 +2296,8 @@ def main():
     p.add_argument("--env", action="append", metavar="K=V",
                    help="extra env var for the worker (repeatable)")
     p.add_argument("--vertical", action="store_true", help="split vertically")
+    p.add_argument("--min-height", type=int, default=12,
+                   help="minimum rows per right-stack worker (default: 12)")
     p.add_argument("--ready-timeout", type=float, default=30,
                    help="seconds to wait for worker readiness (default: 30)")
     p.add_argument("--json", action="store_true")
@@ -2143,6 +2307,8 @@ def main():
 
     p = sub.add_parser("ack", help="mark collected results as seen: done -> idle")
     p.add_argument("--id", required=True, help="agent id(s), comma-separated")
+    p.add_argument("--kill-pane", action="store_true",
+                   help="also kill a finished agent pane or a pane at a shell")
     p.set_defaults(fn=cmd_ack)
 
     p = sub.add_parser("resume", help="type an agent's native resume command into its pane")

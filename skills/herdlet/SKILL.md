@@ -80,7 +80,12 @@ wording (you `peek`ed a limited worker into your own pane) is flagged too. when
 
 ```bash
 herdlet wait --id builder --state done --timeout 600
+herdlet wait --id builder --on-compact --timeout 600
 ```
+
+`--on-compact` wakes on the next increase of the target's `compacts` counter.
+you can combine it with `--state` to wake for either event. a 120-second wait
+used 33,648 KiB RSS with Python 3.14.6 on macOS.
 
 always include `blocked` and `limited` in the states unless you specifically
 want to sleep through them: a blocked agent will not finish until a human acts,
@@ -367,6 +372,11 @@ another project's window while you worked, your worker lands in that window
 and they lose track of it. `-t "$TMUX_PANE"` splits your own pane, wherever
 the human's focus is. (`herdlet spawn` does this for you.)
 
+`herdlet spawn` keeps the master in the left half and stacks workers in the
+right half. it gives the right workers equal heights. a window under 160
+columns or a stack below `--min-height 12` puts the worker in a new window.
+pass `--vertical` to use the old explicit vertical split.
+
 after they register you drive them with `send` / `wait` / `peek` cycles.
 
 **always launch a worker with an explicit model - never let it inherit the
@@ -472,6 +482,8 @@ read the outcome in the topic file and in their reports.
 after collecting a worker's result, `herdlet ack --id <worker>` clears it from
 the inbox: a `done` (still-alive) worker flips back to `idle`, an `ended` (dead)
 one is removed. then `list` reads as an inbox of live work.
+pass `--kill-pane` to `ack` or `remove` to close a finished pane or a pane at a
+shell. the command leaves a live nonterminal agent open and writes a note.
 switching projects means a new window; leave finished windows alive so the
 user can inspect them.
 
@@ -484,7 +496,8 @@ directories and a premature `clean` can delete a deliverable you never captured.
 
 **watch `compacts` and hand over before it climbs.** `herdlet get` shows
 `compacts`, how many times an agent has compacted its context (its state and
-message are untouched by a compaction). a worker on its second compaction has
+message are untouched by a compaction). `watch` emits a `compacted` event, and
+`list` adds `C<n>` to the state. a worker on its second compaction has
 already lost detail and is paying to re-read what it forgot; that is the signal to end
 its phase, have it write a handover file, and start the next phase with a fresh
 worker rather than nursing it along. your own compactions count too: keep the
@@ -529,6 +542,10 @@ ended its turn by asking you something. either way `peek` first, then:
   herdlet approve --id herdlet/dev --option 3 --wait    # deny, then wait+peek; follow up with `send` if off-task
   tmux send-keys -t %5 Escape                           # dismiss a dialog
   ```
+
+`approve` scans the full visible pane before it types. without a supported
+menu, it exits 5 and shows the last five non-empty lines. it also changes a
+stale `blocked` record to `working` because another user answered the menu.
 
 rules of thumb: approve only what matches the task you assigned; deny with a
 follow-up instruction if the action looks off-task; escalate to the human

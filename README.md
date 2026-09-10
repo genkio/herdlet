@@ -65,6 +65,7 @@ herdlet wait --id builder --state done,blocked,limited --timeout 600  # push-wok
 herdlet wait --id builder,tester --state done,blocked --timeout 600  # any-of: wakes on whichever first
 herdlet wait --prefix myproject/ --state blocked --timeout 600       # anyone in the project stuck?
 herdlet wait --id builder --state blocked --edge --timeout 600  # ignore stale state, wake on a fresh report only
+herdlet wait --id builder --on-compact --timeout 600         # wake on the next context compaction
 herdlet wait --id builder --state done --timeout 600 --timeout-ok  # timeout is a result, exit 0
 herdlet watch                                    # stream every state change as JSON lines
 herdlet list --here                              # scope to the current tmux session
@@ -82,6 +83,8 @@ herdlet approve --id builder                     # answer a permission menu (opt
 herdlet approve --id builder --wait              # answer, mark working, edge-wait for the next transition, show the pane
 herdlet pair --id dev --with tester --topic plans/repro.md  # scoped peer channel between two workers
 herdlet ack --id builder                         # collected the result: done -> idle (list = inbox)
+herdlet ack --id builder --kill-pane             # also close a finished worker pane
+herdlet remove --id builder --kill-pane          # remove the record and safely close its pane
 herdlet resume --id builder                      # agent died? type its native resume command into the pane
 herdlet monitor                                  # live TUI (made for a tmux popup)
 ```
@@ -93,6 +96,15 @@ back as `result.type: "timeout"` with exit 0. `approve --wait --timeout-ok`
 takes the flag too, where it only changes the exit code (0 instead of 2);
 `approve` prints a state line, not JSON. Neither form hides a hung daemon,
 which still fails.
+
+`approve` types an option only when the visible pane contains a supported
+permission, approval, or trust menu. Without a menu, it exits 5 and shows the
+last five non-empty lines on stderr. It also changes a stale `blocked` record
+to `working` because another user already answered the menu.
+
+`ack --kill-pane` and `remove --kill-pane` close panes for finished records or
+panes at a shell. They do not close a live agent with a nonterminal state. In
+that case, the command writes a note and leaves the pane open.
 
 Agent ids resolve from `--id`, then `$HERDLET_ID`, then `$TMUX_PANE`. Name an
 agent by launching it with an env var: `HERDLET_ID=builder claude`.
@@ -259,9 +271,12 @@ herdlet spawn --agent codex --id personal/herdlet/review --model gpt-5.6-sol --e
 `spawn` launches Claude Code by default. Pass `--agent codex` for Codex. Its
 default sandbox is `workspace-write`, and its default approval policy is
 `on-request`. Repeat `--allow "<command prefix>"` to add worker commands to the
-allowlist in the worker cwd. `spawn` splits the caller's own pane, builds the
-launch line, registers the worker as `spawning`, and links itself to the worker
-one way (see "Peer channel"). It waits for a Claude hook or the Codex input
+allowlist in the worker cwd. `spawn` keeps the caller in the left half. It
+stacks workers at equal heights in the right half. A window under 160 columns,
+or a stack below `--min-height 12`, puts the new worker in a new window.
+`--vertical` keeps the old explicit split behavior. The command registers the
+worker as `spawning` and links itself to the worker one way (see "Peer channel").
+It waits for a Claude hook or the Codex input
 prompt, then hands the worker its brief. `--model` and
 `--effort` are required on purpose: a worker is a
 top-level session, so anything you do not pin explicitly runs on your MAIN
@@ -408,6 +423,10 @@ matching agent; the result carries `matched`, every agent currently in a
 target state, so a herd wait can batch-collect instead of re-waiting per
 straggler), `subscribe` (`{id?, state?}`, connection then streams
 `agent.state_changed` / `agent.removed` events).
+
+A `PreCompact` hook emits a `compacted` watch event. Pass `wait --on-compact`
+to wake on the next counter increase. The `list` STATE column adds `C<n>` when
+the counter is more than zero.
 
 A `blocked` agent is re-announced to waiters every `HERDLET_BLOCKED_REEMIT`
 seconds (default 30, 0 disables), so a `wait` - especially `--edge` - that

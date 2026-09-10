@@ -109,6 +109,19 @@ class HerdletTest(unittest.TestCase):
         timer.join()
         self.assertEqual(resp["result"]["state"], "blocked")
 
+    def test_wait_on_compact_wakes_on_the_next_increase(self):
+        self.parse(self.run_cli("report", "--id", "wc1", "--state", "working"))
+        timer = threading.Timer(0.3, lambda: self.run_cli(
+            "hook", stdin=json.dumps({"hook_event_name": "PreCompact"}),
+            env_extra={"HERDLET_ID": "wc1"}))
+        timer.start()
+        resp = self.parse(self.run_cli(
+            "wait", "--id", "wc1", "--on-compact", "--timeout", "5"))
+        timer.join()
+        self.assertEqual(resp["result"]["type"], "compacted")
+        self.assertEqual(resp["result"]["compacts"], 1)
+        self.assertFalse(resp["result"]["already"])
+
     def test_wait_timeout_exit_2(self):
         proc = self.run_cli("wait", "--id", "ghost", "--state", "done", "--timeout", "0.3")
         self.assertEqual(proc.returncode, 2)
@@ -304,6 +317,22 @@ class HerdletTest(unittest.TestCase):
         event = json.loads(stream.readline())
         self.assertEqual(event["type"], "agent.state_changed")
         self.assertEqual(event["id"], "s1")
+        conn.close()
+
+    def test_subscribe_pushes_a_compacted_event(self):
+        self.parse(self.run_cli("report", "--id", "sc1", "--state", "working"))
+        conn = socket.socket(socket.AF_UNIX)
+        conn.settimeout(5)
+        conn.connect(self.sock)
+        stream = conn.makefile("rwb")
+        stream.write(b'{"id":"s","method":"subscribe","params":{"id":"sc1"}}\n')
+        stream.flush()
+        stream.readline()
+        self.run_cli("hook", stdin=json.dumps({"hook_event_name": "PreCompact"}),
+                     env_extra={"HERDLET_ID": "sc1"})
+        event = json.loads(stream.readline())
+        self.assertEqual(event["type"], "compacted")
+        self.assertEqual(event["compacts"], 1)
         conn.close()
 
     def test_hook_claude_lifecycle(self):
@@ -526,6 +555,13 @@ class HerdletTest(unittest.TestCase):
         rec = self.parse(self.run_cli("get", "--id", "pc1"))["result"]
         self.assertEqual(rec["compacts"], 2)
         self.assertEqual(rec["message"], "big job")
+
+    def test_list_marks_compacted_records_in_the_state_column(self):
+        self.parse(self.run_cli("report", "--id", "lc1", "--state", "working"))
+        self.run_cli("hook", stdin=json.dumps({"hook_event_name": "PreCompact"}),
+                     env_extra={"HERDLET_ID": "lc1"})
+        proc = self.run_cli("list", "--prefix", "lc1")
+        self.assertIn("working C1", proc.stdout)
 
     def test_hook_precompact_for_an_unknown_id_registers_nothing(self):
         # a compaction says nothing about state, so it must not create a record
@@ -1232,7 +1268,7 @@ class LimitSweepTest(unittest.TestCase):
     def test_limited_wakes_waiters(self):
         woken = []
         self.bus.waiters.append(
-            (lambda i, s: s == "limited", _FakeFuture(woken)))
+            (lambda i, s, e: s == "limited", _FakeFuture(woken)))
         self.sweep(lambda pane: "Usage limit reached")
         self.assertEqual(len(woken), 1)
 
@@ -1386,6 +1422,35 @@ CODEX_MENU_PANE = """\
   Press enter to confirm or esc to go back
 """
 
+CLAUDE_APPROVAL_MENU = """\
+ Bash command
+
+   python3 -m unittest
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and do not ask again
+   3. No
+
+ Esc to cancel · Enter to confirm
+"""
+
+CODEX_APPROVAL_MENU = """\
+  Do you want to run this command?
+
+  1. Yes, proceed
+› 2. No, go back
+
+  Press enter to confirm or esc to cancel
+"""
+
+CODEX_TRUST_MENU = """\
+Do you trust the contents of this directory?
+
+› 1. Yes, continue
+  2. No, quit
+"""
+
 
 class PaneInputTextTest(unittest.TestCase):
     def setUp(self):
@@ -1404,6 +1469,13 @@ class PaneInputTextTest(unittest.TestCase):
             with self.subTest(expected=expected):
                 self.assertEqual(self.h.pane_input_text(capture + "\n" * 20),
                                  expected)
+
+    def test_full_pane_menu_fixtures(self):
+        for capture in (CLAUDE_PERMISSION_PANE, CLAUDE_APPROVAL_MENU,
+                        CODEX_APPROVAL_MENU, CODEX_TRUST_MENU):
+            with self.subTest(capture=capture):
+                self.assertTrue(self.h.pane_has_menu(capture))
+        self.assertFalse(self.h.pane_has_menu(CLAUDE_EMPTY_PANE))
 
 
 class VerifiedSendTest(unittest.TestCase):
@@ -1623,7 +1695,10 @@ class SpawnLineTest(unittest.TestCase):
             self.h.spawn_split_argv("%3", "/tmp", "LINE"),
             ("split-window", "-d", "-h", "-P", "-F", "#{pane_id}",
              "-t", "%3", "-c", "/tmp", "LINE"))
-        self.assertIn("-v", self.h.spawn_split_argv("%3", "/tmp", "LINE", True))
+        self.assertIn("-v", self.h.spawn_split_argv(
+            "%3", "/tmp", "LINE", "-v"))
+        self.assertIn("79", self.h.spawn_split_argv(
+            "%3", "/tmp", "LINE", "-h", 79))
 
     def test_new_window_fallback_argv(self):
         self.assertEqual(
@@ -1644,6 +1719,53 @@ class SpawnLineTest(unittest.TestCase):
                          "opus/high")
         self.assertEqual(self.h.model_cell({"model": "opus"}), "opus")
         self.assertEqual(self.h.model_cell({}), "")
+
+
+class SpawnPlacementTest(unittest.TestCase):
+    def setUp(self):
+        self.h = _load_module()
+
+    def panes(self, *lines):
+        return self.h.spawn_panes("\n".join(lines))
+
+    def test_first_worker_splits_the_master_to_the_right(self):
+        panes = self.panes("%1\t0\t0\t200\t48\t200")
+        self.assertEqual(self.h.spawn_target("%1", panes, 12),
+                         ("%1", "-h", 99))
+
+    def test_later_worker_splits_the_bottom_right_pane(self):
+        panes = self.panes(
+            "%1\t0\t0\t100\t48\t200",
+            "%2\t101\t0\t99\t23\t200",
+            "%3\t101\t24\t99\t24\t200")
+        self.assertEqual(self.h.spawn_target("%1", panes, 12),
+                         ("%3", "-v", None))
+
+    def test_small_window_uses_a_new_window(self):
+        panes = self.panes("%1\t0\t0\t159\t48\t159")
+        self.assertIsNone(self.h.spawn_target("%1", panes, 12))
+
+    def test_short_first_worker_uses_a_new_window(self):
+        panes = self.panes("%1\t0\t0\t200\t11\t200")
+        self.assertIsNone(self.h.spawn_target("%1", panes, 12))
+
+    def test_short_right_stack_uses_a_new_window(self):
+        panes = self.panes(
+            "%1\t0\t0\t100\t25\t200",
+            "%2\t101\t0\t99\t12\t200",
+            "%3\t101\t13\t99\t12\t200")
+        self.assertIsNone(self.h.spawn_target("%1", panes, 12))
+
+    def test_narrow_master_is_not_shrunk_again(self):
+        panes = self.panes(
+            "%1\t0\t0\t90\t48\t200",
+            "%2\t91\t0\t109\t48\t200")
+        self.assertIsNone(self.h.spawn_target("%1", panes, 12))
+
+    def test_vertical_override_keeps_the_old_target(self):
+        panes = self.panes("%1\t0\t0\t100\t8\t120")
+        self.assertEqual(self.h.spawn_target("%1", panes, 12, vertical=True),
+                         ("%1", "-v", None))
 
 
 class SpawnAllowlistTest(unittest.TestCase):
@@ -1747,6 +1869,7 @@ class SpawnCommandTest(_DaemonCase):
         self.sent = []
         self.h.send_text = lambda pane, text, no_enter=False: self.sent.append((pane, text))
         self.panes = {"%0", "%7"}
+        self.did_split = False
         self.h.tmux = self._tmux
         self.h.tmux_run = self._tmux_run
 
@@ -1757,9 +1880,17 @@ class SpawnCommandTest(_DaemonCase):
     def _tmux_run(self, *args, input=None, timeout=5):
         self.runs.append(args)
         if args[0] == "split-window":
-            return self.split_result()
+            result = self.split_result()
+            self.did_split = result.returncode == 0
+            return result
         if args[0] == "new-window":
             return subprocess.CompletedProcess(args, 0, "%9\n", "")
+        if args[0] == "list-panes":
+            output = "%0\t0\t0\t180\t40\t180\n"
+            if self.did_split:
+                output = ("%0\t0\t0\t90\t40\t180\n"
+                          "%7\t91\t0\t89\t40\t180\n")
+            return subprocess.CompletedProcess(args, 0, output, "")
         if args[0] == "display-message" and "#{session_name}" in args:
             return subprocess.CompletedProcess(args, 0, "work\n", "")
         if args[0] == "display-message" and "#{pane_id}" in args:
@@ -1777,7 +1908,8 @@ class SpawnCommandTest(_DaemonCase):
                     agent="claude", title=None, brief=None, cwd=None,
                     permission_mode="auto", env=None, vertical=False,
                     ready_timeout=0.5, json=False, program="claude",
-                    program_args=None, sandbox=None, approval=None, allow=None)
+                    program_args=None, sandbox=None, approval=None, allow=None,
+                    min_height=12)
         base.update(kw)
         return _Args(**base)
 
@@ -1982,7 +2114,8 @@ class SpawnCommandTest(_DaemonCase):
         self.assertEqual(payload, {
             "type": "spawned", "id": "proj/dev", "pane": "%7", "model": "opus",
             "effort": "high", "title": "Do the thing", "cwd": os.getcwd(),
-            "ready": True, "brief_sent": True, "note": None})
+            "ready": True, "brief_sent": True, "note": None,
+            "placement": "right-stack"})
         self.assertEqual(code, 0)
 
     def test_json_payload_reports_a_withheld_brief(self):
@@ -1999,7 +2132,8 @@ class ApproveTimeoutTest(_DaemonCase):
     def setUp(self):
         self.captured = []
         super().setUp()
-        self.h.tmux = lambda *a, **kw: self.captured.append(a) or "pane text"
+        self.screen = CLAUDE_APPROVAL_MENU
+        self.h.tmux = lambda *a, **kw: self.captured.append(a) or self.screen
         self.h.call(self.sock, "agent.report",
                     {"id": "ap/one", "state": "blocked", "pane": "%4"})
 
@@ -2010,27 +2144,42 @@ class ApproveTimeoutTest(_DaemonCase):
         return _Args(**base)
 
     def approve(self, **kw):
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = self.h.cmd_approve(self.args(**kw))
-        return code, out.getvalue()
+        return code, out.getvalue(), err.getvalue()
 
     def test_approve_marks_the_record_working_without_wait(self):
-        code, out = self.approve(wait=False)
+        code, out, err = self.approve(wait=False)
         record = self.record("ap/one")
         self.assertEqual(record["state"], "working")
         self.assertEqual(record["message"], "approved option 1")
         self.assertEqual(code, 0)
+        self.assertEqual(err, "")
 
     def test_wait_timeout_exits_2_by_default(self):
-        code, out = self.approve()
+        code, out, err = self.approve()
         self.assertIn("state: timeout", out)
         self.assertEqual(code, 2)
 
     def test_timeout_ok_exits_0(self):
-        code, out = self.approve(timeout_ok=True)
+        code, out, err = self.approve(timeout_ok=True)
         self.assertIn("state: timeout", out)   # still says so, just exits 0
         self.assertEqual(code, 0)
+
+    def test_no_menu_types_nothing_and_clears_stale_blocked(self):
+        self.screen = CLAUDE_EMPTY_PANE
+        code, out, err = self.approve(wait=False)
+        self.assertEqual(code, 5)
+        self.assertEqual(out, "")
+        self.assertIn("no menu on ap/one; nothing typed", err)
+        self.assertNotIn("send-keys", [args[0] for args in self.captured])
+        record = self.record("ap/one")
+        self.assertEqual(record["state"], "working")
+        self.assertIsNone(record["message"])
+        tail = [line for line in err.splitlines()
+                if not line.startswith("herdlet:")]
+        self.assertEqual(tail, self.h.pane_tail(CLAUDE_EMPTY_PANE))
 
     def test_a_hung_daemon_still_fails_under_timeout_ok(self):
         real = self.h.call
@@ -2042,6 +2191,23 @@ class ApproveTimeoutTest(_DaemonCase):
 
         self.h.call = hang
         self.assertEqual(self.approve(timeout_ok=True)[0], 2)
+
+
+class PaneKillGuardTest(unittest.TestCase):
+    def setUp(self):
+        self.h = _load_module()
+
+    def test_finished_agent_can_be_killed_while_its_tui_is_live(self):
+        self.assertTrue(self.h.pane_kill_allowed({"state": "done"}, "node"))
+
+    def test_ended_agent_can_be_killed(self):
+        self.assertTrue(self.h.pane_kill_allowed({"state": "ended"}, "claude"))
+
+    def test_shell_can_be_killed_for_a_nonterminal_record(self):
+        self.assertTrue(self.h.pane_kill_allowed({"state": "working"}, "zsh"))
+
+    def test_live_nonterminal_agent_is_refused(self):
+        self.assertFalse(self.h.pane_kill_allowed({"state": "working"}, "node"))
 
 
 class TimeoutResultTest(unittest.TestCase):
