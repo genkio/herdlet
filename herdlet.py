@@ -577,13 +577,16 @@ def limit_regex():
     return LIMIT_RE
 
 
-async def _serve(sock_path):
+async def _serve(sock_path, bound=None):
     limit_regex()  # compile here, so a bad pattern is logged once, by the daemon
     bus = Bus(state_path=sock_path + ".state")
     bus.start_prune_sweeps()
     bus.start_limit_sweeps()
-    server = await asyncio.start_unix_server(
-        lambda r, w: _handle_client(r, w, bus), path=sock_path)
+    handler = lambda r, w: _handle_client(r, w, bus)
+    if bound is None:
+        server = await asyncio.start_unix_server(handler, path=sock_path)
+    else:
+        server = await asyncio.start_unix_server(handler, sock=bound)
     os.chmod(sock_path, 0o600)
     _log(f"herdlet {__version__} listening on {sock_path}")
 
@@ -606,21 +609,72 @@ def daemon_running(sock_path):
         return False
 
 
+def bind_socket(sock_path):
+    """Bind the unix socket, atomically.
+
+    bind(2) is the election: it fails with EADDRINUSE when another daemon owns
+    the path. asyncio.start_unix_server(path=...) is not usable here because it
+    silently unlinks an existing socket file before binding, so every racer
+    would believe it won (and orphan the previous listener).
+    """
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.bind(sock_path)
+    except OSError:
+        sock.close()
+        raise
+    return sock
+
+
+def daemon_lock(sock_path):
+    """Exclusive lock held for the daemon's lifetime.
+
+    check-then-bind alone is a TOCTOU race: two hooks auto-starting the daemon
+    at once could both pass the check and both bind (asyncio unlinks the path
+    first), leaving two live registries where clients see only one. The flock
+    makes "am I the starter?" a single atomic decision, and the loser exits
+    without ever touching the winner's socket.
+    """
+    fd = os.open(sock_path + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+    return os.fdopen(fd, "r+")
+
+
 def cmd_serve(args):
-    if os.path.exists(args.socket):
-        if daemon_running(args.socket):
+    lock = daemon_lock(args.socket)
+    try:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # another daemon holds the lock: already serving, or starting up
             if args.if_needed:
                 return 0
             print(f"herdlet already running on {args.socket}", file=sys.stderr)
             return 1
-        os.unlink(args.socket)  # stale socket from a dead daemon
-    try:
-        asyncio.run(_serve(args.socket))
-    finally:
+        # A pre-lock daemon (older herdlet) can still own the path without
+        # holding the flock; leave a live socket alone.
+        if os.path.exists(args.socket) and daemon_running(args.socket):
+            if args.if_needed:
+                return 0
+            print(f"herdlet already running on {args.socket}", file=sys.stderr)
+            return 1
         try:
-            os.unlink(args.socket)
-        except OSError:
+            os.unlink(args.socket)  # stale socket from a dead daemon
+        except FileNotFoundError:
             pass
+        bound = bind_socket(args.socket)
+        own = os.fstat(bound.fileno()).st_ino
+        try:
+            asyncio.run(_serve(args.socket, bound))
+        finally:
+            # remove the socket only if the path still points at what this
+            # process bound; a replacement daemon's socket must survive us
+            try:
+                if os.stat(args.socket).st_ino == own:
+                    os.unlink(args.socket)
+            except OSError:
+                pass
+    finally:
+        lock.close()
     return 0
 
 

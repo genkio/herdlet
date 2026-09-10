@@ -3,6 +3,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -2633,6 +2634,108 @@ class TranscriptParseTest(unittest.TestCase):
                                                       "content": "hi"}}) + "\n")
         self.assertEqual(self.h.transcript_messages(path, 5),
                          [(None, "plain"), ("t2", "codex")])
+
+
+class DaemonElectionTest(unittest.TestCase):
+    """Auto-start must elect exactly one daemon per socket.
+
+    Regression: serve used to pass its path to asyncio.start_unix_server,
+    which silently unlinks an existing socket before binding. Two racers both
+    became listeners, and the loser's finally-unlink deleted the winner's
+    path, leaving a live but unreachable registry behind.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.sock = os.path.join(self.tmp.name, "e.sock")
+        self.daemons = []
+        self.addCleanup(self._kill_all)
+
+    def _kill_all(self):
+        for proc in self.daemons:
+            if proc.poll() is None:
+                proc.terminate()
+        for proc in self.daemons:
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        for pid in self.live_daemons():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+    def serve(self, *extra):
+        proc = subprocess.Popen(
+            [sys.executable, BIN, "--socket", self.sock, "serve", *extra],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.daemons.append(proc)
+        return proc
+
+    def ping(self):
+        return subprocess.run(
+            [sys.executable, BIN, "--socket", self.sock, "ping"],
+            capture_output=True, text=True, timeout=15)
+
+    def wait_up(self, timeout=10):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if os.path.exists(self.sock) and self.ping().returncode == 0:
+                return True
+            time.sleep(0.05)
+        return False
+
+    def live_daemons(self):
+        out = subprocess.run(["ps", "-eo", "pid=,command="],
+                             capture_output=True, text=True).stdout
+        return [int(line.split()[0]) for line in out.splitlines()
+                if self.sock in line and " serve" in line]
+
+    def test_concurrent_auto_start_elects_one_daemon(self):
+        for _ in range(5):
+            self.serve("--if-needed")
+        self.assertTrue(self.wait_up(), "no daemon came up")
+        time.sleep(0.5)  # let the losers finish exiting
+        alive = self.live_daemons()
+        self.assertEqual(len(alive), 1, f"expected one daemon, got {alive}")
+        self.assertEqual(self.ping().returncode, 0)
+
+    def test_a_loser_never_deletes_the_winner_socket(self):
+        self.serve()
+        self.assertTrue(self.wait_up())
+        loser = self.serve("--if-needed")
+        self.assertEqual(loser.wait(timeout=10), 0)
+        self.assertTrue(os.path.exists(self.sock))
+        self.assertEqual(self.ping().returncode, 0)
+
+    def test_serve_without_if_needed_refuses_a_running_daemon(self):
+        self.serve()
+        self.assertTrue(self.wait_up())
+        proc = subprocess.run(
+            [sys.executable, BIN, "--socket", self.sock, "serve"],
+            capture_output=True, text=True, timeout=15)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("already running", proc.stderr)
+        self.assertEqual(self.ping().returncode, 0)
+
+    def test_a_stale_socket_is_replaced(self):
+        stale = socket.socket(socket.AF_UNIX)
+        stale.bind(self.sock)
+        stale.close()  # leaves the socket file behind, nothing listening
+        self.serve("--if-needed")
+        self.assertTrue(self.wait_up())
+        self.assertEqual(len(self.live_daemons()), 1)
+
+    def test_a_sigkilled_daemon_is_replaced(self):
+        first = self.serve()
+        self.assertTrue(self.wait_up())
+        first.kill()
+        first.wait(timeout=5)
+        self.serve("--if-needed")
+        self.assertTrue(self.wait_up())
+        self.assertEqual(len(self.live_daemons()), 1)
 
 
 if __name__ == "__main__":
