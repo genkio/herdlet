@@ -341,7 +341,13 @@ class Bus:
                             and entry.name.endswith(".lock")
                             and entry.is_file(follow_symlinks=False)
                             and now - entry.stat(follow_symlinks=False).st_mtime > MAX_AGE):
-                        os.unlink(entry.path)
+                        with open(entry.path, "r+") as lock:
+                            try:
+                                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            except BlockingIOError:
+                                continue
+                            if now - os.fstat(lock.fileno()).st_mtime > MAX_AGE:
+                                os.unlink(entry.path)
                 except OSError:
                     continue
 
@@ -1287,8 +1293,10 @@ def send_lock(sock_path, pane):
     state_dir = sock_path + ".state.d"
     os.makedirs(state_dir, mode=0o700, exist_ok=True)
     name = re.sub(r"[^A-Za-z0-9_.-]", "_", pane)
-    lock = open(os.path.join(state_dir, f"send-{name}.lock"), "a+")
+    path = os.path.join(state_dir, f"send-{name}.lock")
+    lock = open(path, "a+")
     fcntl.flock(lock, fcntl.LOCK_EX)
+    os.utime(path, None)
     return lock
 
 

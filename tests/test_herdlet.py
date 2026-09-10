@@ -1665,6 +1665,36 @@ class SendLockTest(unittest.TestCase):
             self.assertTrue(os.path.exists(fresh))
             self.assertTrue(os.path.exists(unrelated))
 
+    def test_daemon_does_not_prune_an_old_held_lock(self):
+        h = _load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = os.path.join(directory, "herdlet.sock")
+            lock = h.send_lock(socket_path, "%10")
+            try:
+                old = time.time() - h.MAX_AGE - 1
+                os.utime(lock.name, (old, old))
+                h.Bus(state_path=socket_path + ".state")._prune_sweep()
+                self.assertTrue(os.path.exists(lock.name))
+            finally:
+                lock.close()
+
+    def test_acquiring_a_lock_refreshes_its_mtime(self):
+        h = _load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = os.path.join(directory, "herdlet.sock")
+            lock_dir = socket_path + ".state.d"
+            os.makedirs(lock_dir)
+            path = os.path.join(lock_dir, "send-_11.lock")
+            with open(path, "w"):
+                pass
+            old = time.time() - h.MAX_AGE - 1
+            os.utime(path, (old, old))
+            lock = h.send_lock(socket_path, "%11")
+            try:
+                self.assertGreater(os.stat(path).st_mtime, old)
+            finally:
+                lock.close()
+
 
 class SendCommandTest(unittest.TestCase):
     def setUp(self):
