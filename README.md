@@ -79,8 +79,9 @@ herdlet send --id builder "run the tests again"  # types into builder's pane + E
 herdlet send --id builder --file plans/next.md   # long or multi-line message from a file ('-' = stdin)
 herdlet peek --id builder --lines 40             # read builder's recent output (--join unwraps soft wraps)
 herdlet peek --id builder --transcript --lines 2 # read builder's own transcript instead of the pane
-herdlet approve --id builder                     # answer a permission menu (option 1), echo the pane
-herdlet approve --id builder --wait              # answer, mark working, edge-wait for the next transition, show the pane
+herdlet approve --id builder                     # choose the first one-time Yes, then echo the pane
+herdlet approve --id builder --choice always     # choose the matching don't-ask-again option
+herdlet approve --id builder --choice no --wait  # deny, then edge-wait for the next transition
 herdlet pair --id dev --with tester --topic plans/repro.md  # scoped peer channel between two workers
 herdlet ack --id builder                         # collected the result: done -> idle (list = inbox)
 herdlet ack --id builder --kill-pane             # also close a finished worker pane
@@ -97,10 +98,19 @@ takes the flag too, where it only changes the exit code (0 instead of 2);
 `approve` prints a state line, not JSON. Neither form hides a hung daemon,
 which still fails.
 
-`approve` types an option only when the visible pane contains a supported
-permission, approval, or trust menu. Without a menu, it exits 5 and shows the
-last five non-empty lines on stderr. It also changes a stale `blocked` record
-to `working` because another user already answered the menu.
+`approve` selects `--choice yes` by default. `--choice always` selects a visible
+"do not ask again" or "always" option. If that option is absent, it selects
+the one-time Yes option and writes a note. On a Codex trust menu, `yes` and
+`always` both select option 1.
+
+Use `--option N` only as a raw escape hatch. Codex menu lengths vary, so a
+digit can mean Yes on one menu and No on another. For Codex, `always` suppresses
+only the exact command prefix that the menu shows.
+
+`approve` types only when the visible pane contains a supported permission,
+approval, or trust menu. Without a menu, it exits 5 and shows the last five
+non-empty lines on stderr. It also changes a stale `blocked` record to `working`
+because another user already answered the menu.
 
 `ack --kill-pane` and `remove --kill-pane` close panes for finished records or
 panes at a shell. They do not close a live agent with a nonterminal state. In

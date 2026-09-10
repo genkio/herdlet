@@ -530,18 +530,25 @@ ended its turn by asking you something. either way `peek` first, then:
 
 - **question in plain text**: answer it like a user would:
   `herdlet send --id herdlet/dev "yes, proceed with both releases"`
-- **permission menu** (numbered options): `approve` presses the option key
-  (menus react to a bare keypress; `send` would append Enter). `--wait` is
-  the primary form: one call answers, marks the worker `working`, waits for
-  its next real transition (edge-waited, so it can't match the stale
-  pre-answer state), and shows the pane - the whole babysit cycle in one
-  shot instead of three hand-rolled calls:
+- **permission menu** (numbered options): `approve` selects `--choice yes` by
+  default. use `--choice always` for a matching don't-ask-again option, or
+  `--choice no` to deny. menus react to a bare keypress; `send` would append
+  Enter. `--wait` is the primary form. one call answers and marks the worker
+  `working`. then it waits for the next real transition and shows the pane.
+  the edge wait cannot match the stale pre-answer state:
 
   ```bash
-  herdlet approve --id herdlet/dev --wait               # option 1: approve once, then wait+peek
-  herdlet approve --id herdlet/dev --option 3 --wait    # deny, then wait+peek; follow up with `send` if off-task
+  herdlet approve --id herdlet/dev --wait                  # one-time Yes, then wait+peek
+  herdlet approve --id herdlet/dev --choice always --wait  # matching don't-ask-again choice
+  herdlet approve --id herdlet/dev --choice no --wait      # deny, then wait+peek
   tmux send-keys -t %5 Escape                           # dismiss a dialog
   ```
+
+if an `always` option is absent, `approve` selects the one-time Yes option and
+writes a note. on a Codex trust menu, `yes` and `always` both select option 1.
+use `--option N` only as a raw escape hatch. Codex menu lengths vary, so the
+same digit can approve one menu and deny another. for Codex, `always` suppresses
+only the exact command prefix that the menu shows.
 
 `approve` scans the full visible pane before it types. without a supported
 menu, it exits 5 and shows the last five non-empty lines. it also changes a

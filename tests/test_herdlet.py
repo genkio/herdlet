@@ -172,6 +172,12 @@ class HerdletTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("single digit", proc.stderr)
 
+    def test_approve_rejects_choice_with_a_raw_option(self):
+        proc = self.run_cli("approve", "--id", "x", "--choice", "yes",
+                            "--option", "1")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("not allowed with argument", proc.stderr)
+
     def test_approve_wait_unknown_id(self):
         proc = self.run_cli("approve", "--id", "nope", "--wait")
         self.assertEqual(proc.returncode, 1)
@@ -1439,7 +1445,28 @@ CODEX_APPROVAL_MENU = """\
   Do you want to run this command?
 
   1. Yes, proceed
-› 2. No, go back
+› 2. No, and tell Codex what to do differently
+
+  Press enter to confirm or esc to cancel
+"""
+
+CODEX_THREE_OPTION_MENU = """\
+  Do you want to run this command?
+
+  1. Yes, proceed
+  2. Yes, and don't ask again for commands starting with `touch`
+› 3. No, and tell Codex what to do differently
+
+  Press enter to confirm or esc to cancel
+"""
+
+CODEX_FILE_WRITE_MENU = """\
+  Allow Codex to write these files?
+
+  1. Yes, allow once
+› 2. Yes, and don't ask again for these
+     files
+  3. No, and tell Codex what to do differently
 
   Press enter to confirm or esc to cancel
 """
@@ -1449,6 +1476,15 @@ Do you trust the contents of this directory?
 
 › 1. Yes, continue
   2. No, quit
+"""
+
+CLAUDE_TWO_OPTION_MENU = """\
+ Do you want to proceed?
+
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Enter to confirm
 """
 
 
@@ -1476,6 +1512,38 @@ class PaneInputTextTest(unittest.TestCase):
             with self.subTest(capture=capture):
                 self.assertTrue(self.h.pane_has_menu(capture))
         self.assertFalse(self.h.pane_has_menu(CLAUDE_EMPTY_PANE))
+
+
+class ApproveChoiceTest(unittest.TestCase):
+    def setUp(self):
+        self.h = _load_module()
+
+    def assert_choices(self, capture, yes, always, no, fallback=False):
+        self.assertEqual(self.h.approve_choice(capture, "yes"),
+                         (yes, "yes", False))
+        selected = "yes" if fallback else "always"
+        self.assertEqual(self.h.approve_choice(capture, "always"),
+                         (always, selected, fallback))
+        self.assertEqual(self.h.approve_choice(capture, "no"),
+                         (no, "no", False))
+
+    def test_three_option_codex_command_menu(self):
+        self.assert_choices(CODEX_THREE_OPTION_MENU, "1", "2", "3")
+
+    def test_two_option_codex_command_menu(self):
+        self.assert_choices(CODEX_APPROVAL_MENU, "1", "1", "2", fallback=True)
+
+    def test_codex_file_write_menu_with_wrapped_always_text(self):
+        self.assert_choices(CODEX_FILE_WRITE_MENU, "1", "2", "3")
+
+    def test_claude_permission_menu(self):
+        self.assert_choices(CLAUDE_PERMISSION_PANE, "1", "2", "3")
+
+    def test_two_option_claude_menu(self):
+        self.assert_choices(CLAUDE_TWO_OPTION_MENU, "1", "1", "2", fallback=True)
+
+    def test_codex_trust_menu_maps_yes_and_always_to_one(self):
+        self.assert_choices(CODEX_TRUST_MENU, "1", "1", "2")
 
 
 class VerifiedSendTest(unittest.TestCase):
@@ -2138,8 +2206,9 @@ class ApproveTimeoutTest(_DaemonCase):
                     {"id": "ap/one", "state": "blocked", "pane": "%4"})
 
     def args(self, **kw):
-        base = dict(socket=self.sock, id="ap/one", option="1", lines=5, settle=0.0,
-                    wait=True, state="done", timeout=0.4, timeout_ok=False)
+        base = dict(socket=self.sock, id="ap/one", option="1", choice="yes",
+                    lines=5, settle=0.0, wait=True, state="done", timeout=0.4,
+                    timeout_ok=False)
         base.update(kw)
         return _Args(**base)
 
@@ -2156,6 +2225,25 @@ class ApproveTimeoutTest(_DaemonCase):
         self.assertEqual(record["message"], "approved option 1")
         self.assertEqual(code, 0)
         self.assertEqual(err, "")
+
+    def test_semantic_always_selects_option_two_and_records_the_choice(self):
+        code, out, err = self.approve(option=None, choice="always", wait=False)
+        keys = [args for args in self.captured if args[0] == "send-keys"]
+        self.assertEqual(keys, [("send-keys", "-t", "%4", "2")])
+        self.assertEqual(self.record("ap/one")["message"],
+                         "approved always (option 2)")
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+
+    def test_missing_always_falls_back_to_yes_and_records_yes(self):
+        self.screen = CODEX_APPROVAL_MENU
+        code, out, err = self.approve(option=None, choice="always", wait=False)
+        keys = [args for args in self.captured if args[0] == "send-keys"]
+        self.assertEqual(keys, [("send-keys", "-t", "%4", "1")])
+        self.assertEqual(self.record("ap/one")["message"],
+                         "approved yes (option 1)")
+        self.assertIn('no "don\'t ask again" option on this menu; chose Yes', err)
+        self.assertEqual(code, 0)
 
     def test_wait_timeout_exits_2_by_default(self):
         code, out, err = self.approve()

@@ -1893,6 +1893,60 @@ def pane_has_menu(capture):
     return len(choices) >= 2 and bool(controls)
 
 
+def menu_options(capture):
+    options = []
+    current = None
+    for line in capture.splitlines():
+        match = re.match(r"^\s*[❯›>]?\s*(\d+)\.\s+(\S.*)\s*$", line)
+        if match:
+            if current:
+                options.append((current[0], " ".join(current[1])))
+            current = (match.group(1), [match.group(2).strip()])
+            continue
+        if current:
+            text = line.strip()
+            if re.search(r"(?:esc to cancel|enter to confirm)", text, re.I):
+                options.append((current[0], " ".join(current[1])))
+                current = None
+            elif text and not re.fullmatch(r"[─━]+", text):
+                current[1].append(text)
+    if current:
+        options.append((current[0], " ".join(current[1])))
+    return options
+
+
+def approve_choice(capture, choice):
+    options = menu_options(capture)
+    if codex_trust_prompt(capture):
+        number = "2" if choice == "no" else "1"
+        return number, choice, False
+
+    def normalized(text):
+        return text.lower().replace("’", "'")
+
+    def is_always(text):
+        text = normalized(text)
+        return (not text.startswith("no")
+                and ("don't ask again" in text or "do not ask again" in text
+                     or "and don't ask" in text or "always" in text))
+
+    if choice == "always":
+        match = next((number for number, text in options if is_always(text)), None)
+        if match:
+            return match, "always", False
+        choice = "yes"
+        fallback = True
+    else:
+        fallback = False
+    if choice == "yes":
+        match = next((number for number, text in options
+                      if normalized(text).startswith("yes") and not is_always(text)), None)
+    else:
+        match = next((number for number, text in options
+                      if normalized(text).startswith("no")), None)
+    return match, choice, fallback
+
+
 def pane_tail(capture, lines=5):
     return [line.strip() for line in capture.splitlines() if line.strip()][-lines:]
 
@@ -1953,7 +2007,8 @@ def cmd_resume(args):
 
 
 def cmd_approve(args):
-    if not (len(args.option) == 1 and args.option.isdigit()):
+    if args.option is not None and not (
+            len(args.option) == 1 and args.option.isdigit()):
         die("--option must be a single digit menu key")
     pane = resolve_pane(args.socket, args.id)
     capture = tmux("capture-pane", "-p", "-J", "-t", pane, check=True) or ""
@@ -1969,7 +2024,20 @@ def cmd_approve(args):
         for line in pane_tail(capture):
             print(line, file=sys.stderr)
         return 5
-    tmux("send-keys", "-t", pane, args.option, check=True)  # bare keypress: menus react without Enter
+    option = args.option
+    approved = None
+    if option is None:
+        option, approved, fallback = approve_choice(capture, args.choice)
+        if fallback:
+            print("herdlet: no \"don't ask again\" option on this menu; chose Yes",
+                  file=sys.stderr)
+        if option is None:
+            print(f"herdlet: no {args.choice} option on this menu; nothing typed",
+                  file=sys.stderr)
+            for line in pane_tail(capture):
+                print(line, file=sys.stderr)
+            return 5
+    tmux("send-keys", "-t", pane, option, check=True)  # bare keypress: menus react without Enter
     report_failed = False
     try:
         record = call(args.socket, "agent.get", {"id": args.id}).get("result")
@@ -1977,7 +2045,8 @@ def cmd_approve(args):
         if edge:
             call(args.socket, "agent.report",
                  {"id": args.id, "state": "working",
-                  "message": f"approved option {args.option}"}, timeout=1.0)
+                  "message": (f"approved {approved} (option {option})" if approved
+                              else f"approved option {option}")}, timeout=1.0)
     except OSError:
         edge, report_failed = False, True
     time.sleep(args.settle)
@@ -2321,7 +2390,10 @@ def main():
 
     p = sub.add_parser("approve", help="answer an agent's numbered permission menu, then show its pane")
     p.add_argument("--id", required=True, help="agent id or tmux pane id")
-    p.add_argument("--option", default="1", help="menu option key to press (default: 1)")
+    choice = p.add_mutually_exclusive_group()
+    choice.add_argument("--choice", choices=("yes", "always", "no"), default="yes",
+                        help="select by option text (default: yes)")
+    choice.add_argument("--option", help="unsafe raw menu option digit")
     p.add_argument("--lines", type=int, default=20, help="pane lines to echo back after answering")
     p.add_argument("--settle", type=float, default=1.0,
                    help="seconds to let the TUI redraw before reading (default: 1.0)")
