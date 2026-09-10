@@ -43,7 +43,8 @@ DEFAULT_SOCK = os.environ.get("HERDLET_SOCKET", os.path.expanduser("~/.herdlet.s
 LOG_PATH = os.path.expanduser("~/.herdlet.log")
 STATES = ("idle", "working", "spawning", "blocked", "limited", "done", "ended", "unknown")
 TERMINAL = ("done", "ended")  # agent's turn/session finished; record kept for collection + resume
-MERGE_KEYS = ("message", "agent", "pane", "cwd", "session", "transcript", "model", "effort")
+MERGE_KEYS = ("message", "agent", "pane", "cwd", "session", "transcript",
+              "model", "effort", "tmux")
 SHELLS = {"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "nu"}
 # A pane sitting at a shell only means the agent DIED if it also stopped
 # reporting. A live agent (wrapper script, `claude -p` piped to tee, a shell
@@ -390,8 +391,11 @@ class Bus:
                     if not self._scrapable(rec):
                         continue
                     # off-loop: capture-pane on a dead pane or a missing tmux
-                    # must never stall (or kill) the daemon
-                    text = await loop.run_in_executor(None, capture, rec["pane"])
+                    # must never stall (or kill) the daemon. Read the pane on
+                    # the record's own server: pane ids repeat across servers.
+                    server = rec.get("tmux")
+                    argv = (rec["pane"], server) if server else (rec["pane"],)
+                    text = await loop.run_in_executor(None, capture, *argv)
                     if not text or not limit_regex().search(limit_tail(text)):
                         continue
                     # the await gave the record time to move on, and a banner
@@ -797,17 +801,33 @@ def tmux(*args, check=False, input=None):
     return out.stdout
 
 
-def capture_pane(pane):
-    """Visible pane text, or '' if tmux or the pane is gone."""
-    return tmux("capture-pane", "-p", "-J", "-t", pane) or ""
+def tmux_socket():
+    """The tmux server socket this process talks to, from $TMUX.
+
+    tmux sets TMUX to "<socket>,<pid>,<session>". Pane ids are only unique
+    per server, so the server is part of a record's identity: a %3 on one
+    server is a different pane from a %3 on another. None outside tmux.
+    """
+    return (os.environ.get("TMUX") or "").split(",", 1)[0] or None
+
+
+def tmux_server_args(server):
+    """Global -S arguments that pin a tmux call to a specific server."""
+    return ("-S", server) if server else ()
+
+
+def capture_pane(pane, server=None):
+    """Visible pane text, or '' if tmux, the server, or the pane is gone."""
+    return tmux(*tmux_server_args(server), "capture-pane", "-p", "-J",
+                "-t", pane) or ""
 
 
 def limit_tail(text, lines=LIMIT_TAIL):
     return "\n".join([l for l in text.splitlines() if l.strip()][-lines:])
 
 
-def pane_map():
-    out = tmux("list-panes", "-a", "-F",
+def pane_map(server=None):
+    out = tmux(*tmux_server_args(server), "list-panes", "-a", "-F",
                "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}"
                "\t#{window_name}\t#{pane_current_command}")
     panes = {}
@@ -820,18 +840,41 @@ def pane_map():
     return panes
 
 
-def resolve_pane(sock_path, agent_id):
-    """Registered agent id -> its pane; otherwise treat the id as a tmux target."""
+def pane_maps(agents):
+    """One pane listing per tmux server the records were registered on.
+
+    Records written before the server was recorded (or by a pre-fix daemon)
+    fall back to the caller's own server, the only one they could have come
+    from. A daemon that only saw its own `tmux` would misread a record from
+    another server as the pane with the same id on its own.
+    """
+    here = tmux_socket()
+    maps = {}
+    for rec in agents:
+        server = rec.get("tmux") or here
+        if server not in maps:
+            maps[server] = pane_map(server)
+    return maps
+
+
+def resolve_target(sock_path, agent_id):
+    """Registered agent id -> (pane, its tmux server).
+
+    Otherwise the id is a raw tmux target on the caller's own server."""
     try:
         resp = call(sock_path, "agent.get", {"id": agent_id})
-        pane = resp.get("result", {}).get("pane")
-        if pane:
-            return pane
+        rec = resp.get("result") or {}
+        if rec.get("pane"):
+            return rec["pane"], rec.get("tmux")
     except OSError:
         pass
     if agent_id.startswith("%"):
-        return agent_id
+        return agent_id, None
     die(f"unknown agent '{agent_id}' (see: herdlet list)")
+
+
+def resolve_pane(sock_path, agent_id):
+    return resolve_target(sock_path, agent_id)[0]
 
 
 def cmd_ping(args):
@@ -842,7 +885,9 @@ def cmd_report(args):
     agent_id = args.id or default_id()
     if not agent_id:
         die("no agent id: pass --id, or set HERDLET_ID, or run inside tmux")
-    params = {"id": agent_id, "state": args.state, "pane": args.pane or os.environ.get("TMUX_PANE")}
+    params = {"id": agent_id, "state": args.state,
+              "pane": args.pane or os.environ.get("TMUX_PANE"),
+              "tmux": tmux_socket()}
     if args.message is not None:
         params["message"] = args.message
     if args.agent:
@@ -876,7 +921,8 @@ def kill_record_pane(agent_id, rec, force=False):
     if not pane:
         print(f"{agent_id}: no pane to kill", file=sys.stderr)
         return False
-    status = (tmux("display-message", "-p", "-t", pane,
+    server = tmux_server_args(rec.get("tmux"))
+    status = (tmux(*server, "display-message", "-p", "-t", pane,
                    "#{pane_id}\t#{pane_current_command}") or "").strip()
     if not status:
         print(f"{agent_id}: pane {pane} is gone", file=sys.stderr)
@@ -886,7 +932,7 @@ def kill_record_pane(agent_id, rec, force=False):
         print(f"{agent_id}: pane {pane} still runs {current}; not killed",
               file=sys.stderr)
         return False
-    if tmux("kill-pane", "-t", pane) is None:
+    if tmux(*server, "kill-pane", "-t", pane) is None:
         print(f"{agent_id}: pane {pane} vanished before it could be killed",
               file=sys.stderr)
         return False
@@ -949,13 +995,28 @@ def age(seconds):
     return f"{int(seconds // 86400)}d"
 
 
-def annotate(agents, panes):
+def annotate(agents, panes, pane_maps=None):
+    """Cross-check records against live panes.
+
+    `panes` is a flat pane -> info map for the caller's own server (what the
+    unit tests use). `pane_maps` maps server -> pane map and is preferred by
+    callers whose records can come from more than one server.
+    """
     now = time.time()
+    here = tmux_socket()
     for rec in agents:
         pane = rec.get("pane")
-        if pane and panes and pane not in panes:
-            rec["state"] = "gone"
-        info = panes.get(pane) if pane else None
+        info = None
+        if pane_maps is not None:
+            server_panes = pane_maps.get(rec.get("tmux") or here)
+            if server_panes is not None:
+                if server_panes and pane and pane not in server_panes:
+                    rec["state"] = "gone"
+                info = server_panes.get(pane) if pane else None
+        else:
+            if pane and panes and pane not in panes:
+                rec["state"] = "gone"
+            info = panes.get(pane) if pane else None
         # agent process exited without a hook firing (deny, crash, ctrl-c): the
         # pane is back at a bare shell AND the record has gone quiet. The
         # freshness check is what keeps a just-spawned or actively-hooking worker
@@ -996,7 +1057,8 @@ def state_cell(rec):
 
 def cmd_list(args):
     resp = call_or_die(args.socket, "agent.list", {})
-    agents = annotate(resp.get("result", {}).get("agents", []), pane_map())
+    agents = resp.get("result", {}).get("agents", [])
+    agents = annotate(agents, None, pane_maps(agents))
     agents = filter_agents(agents, args.session, args.here, args.prefix)
     if args.json:
         print(json.dumps(agents, indent=2))
@@ -1047,10 +1109,11 @@ def wait_for_match(args, ids):
         rx = re.compile(args.match)
     except re.error as exc:
         die(f"invalid regex: {exc}")
-    pane = resolve_pane(args.socket, ids[0])
+    pane, server = resolve_target(args.socket, ids[0])
     deadline = time.time() + args.timeout if args.timeout else None
     while True:
-        out = tmux("capture-pane", "-p", "-J", "-t", pane, "-S", f"-{args.lines}", check=True) or ""
+        out = tmux(*tmux_server_args(server), "capture-pane", "-p", "-J",
+                   "-t", pane, "-S", f"-{args.lines}", check=True) or ""
         for line in out.splitlines():
             if rx.search(line):
                 print(json.dumps({"result": {"type": "output_matched",
@@ -1307,7 +1370,8 @@ def cmd_hook(args):
             # `herdlet resume` can bring it back. `remove` (or `ack`) is the
             # explicit way to clear it. pane/cwd are preserved by omission
             # (absent != "" clear); only session is refreshed if the event has one.
-            params = {"id": agent_id, "state": "ended", "agent": args.agent}
+            params = {"id": agent_id, "state": "ended", "agent": args.agent,
+                      "tmux": tmux_socket()}
             if data.get("session_id"):
                 params["session"] = squash(str(data["session_id"]), 200)
             if not ensure_daemon(args.socket):
@@ -1327,7 +1391,8 @@ def cmd_hook(args):
                 return 0
             hook_call(args.socket, "agent.report",
                       {"id": agent_id, "agent": args.agent, "compact": True,
-                       "pane": os.environ.get("TMUX_PANE")})
+                       "pane": os.environ.get("TMUX_PANE"),
+                       "tmux": tmux_socket()})
             return 0
 
         state = HOOK_STATES.get(event)
@@ -1337,6 +1402,7 @@ def cmd_hook(args):
         params = {"id": agent_id, "state": state,
                   "agent": args.agent,
                   "pane": os.environ.get("TMUX_PANE"),
+                  "tmux": tmux_socket(),
                   "cwd": data.get("cwd") or os.getcwd()}
         # the agent's native session ref enables `herdlet resume` later
         if data.get("session_id"):
@@ -1392,10 +1458,11 @@ def pane_input_text(capture):
     return None
 
 
-def wait_for_empty_input(pane, settle):
+def wait_for_empty_input(pane, settle, server=None):
     deadline = time.monotonic() + max(0, settle)
     while True:
-        pending = pane_input_text(capture_pane(pane))
+        pending = pane_input_text(capture_pane(pane, server) if server
+                                  else capture_pane(pane))
         if not pending:
             return pending
         remaining = deadline - time.monotonic()
@@ -1404,21 +1471,22 @@ def wait_for_empty_input(pane, settle):
         time.sleep(min(SEND_POLL_INTERVAL, remaining))
 
 
-def pane_is_shell(pane):
+def pane_is_shell(pane, server=None):
     """Is this pane sitting at a bare shell prompt?
 
     A shell has no TUI input box for the verifier to find, so `send` would
     otherwise refuse it with exit 6. Typing a line into a shell is exactly
     what the caller asked for, so it falls back to the unverified path.
     """
-    return (tmux("display-message", "-p", "-t", pane,
+    return (tmux(*tmux_server_args(server), "display-message", "-p", "-t", pane,
                  "#{pane_current_command}") or "").strip() in SHELLS
 
 
-def send_lock(sock_path, pane):
+def send_lock(sock_path, pane, server=None):
     state_dir = sock_path + ".state.d"
     os.makedirs(state_dir, mode=0o700, exist_ok=True)
-    name = re.sub(r"[^A-Za-z0-9_.-]", "_", pane)
+    key = f"{server}:{pane}" if server else pane
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", key)
     path = os.path.join(state_dir, f"send-{name}.lock")
     lock = open(path, "a+")
     fcntl.flock(lock, fcntl.LOCK_EX)
@@ -1426,32 +1494,38 @@ def send_lock(sock_path, pane):
     return lock
 
 
-def send_text(pane, text, no_enter=False):
+def send_text(pane, text, no_enter=False, server=None):
+    prefix = tmux_server_args(server)
     if "\n" in text or len(text) > SEND_PASTE_OVER:
         # bracketed paste: a readline TUI takes the newlines as text, not submits
         buf = f"herdlet-send-{os.getpid()}"
-        tmux("load-buffer", "-b", buf, "-", input=text, check=True)
-        tmux("paste-buffer", "-p", "-d", "-b", buf, "-t", pane, check=True)
+        tmux(*prefix, "load-buffer", "-b", buf, "-", input=text, check=True)
+        tmux(*prefix, "paste-buffer", "-p", "-d", "-b", buf, "-t", pane,
+             check=True)
     else:
-        tmux("send-keys", "-t", pane, "-l", "--", text, check=True)
+        tmux(*prefix, "send-keys", "-t", pane, "-l", "--", text, check=True)
     if not no_enter:
         time.sleep(0.2)  # let the TUI ingest the text before submit
-        tmux("send-keys", "-t", pane, "Enter", check=True)
+        tmux(*prefix, "send-keys", "-t", pane, "Enter", check=True)
 
 
-def verified_send(pane, text, settle, before_send=None):
-    pending = wait_for_empty_input(pane, settle)
+def verified_send(pane, text, settle, before_send=None, server=None):
+    pending = wait_for_empty_input(pane, settle, server)
     if pending is None:
         return "no-input"
     if pending:
         return "draft"
     if before_send:
         before_send()
-    send_text(pane, text)
-    pending = wait_for_empty_input(pane, settle)
+    if server:
+        send_text(pane, text, server=server)
+    else:
+        send_text(pane, text)
+    pending = wait_for_empty_input(pane, settle, server)
     if pending:
-        tmux("send-keys", "-t", pane, "Enter", check=True)
-        pending = wait_for_empty_input(pane, settle)
+        tmux(*tmux_server_args(server), "send-keys", "-t", pane, "Enter",
+             check=True)
+        pending = wait_for_empty_input(pane, settle, server)
     return "sent" if not pending else "stuck"
 
 
@@ -1571,14 +1645,18 @@ def cmd_send(args):
         die("--settle must be zero or more")
     from_id, topic = peer_scope(args.socket, args.id)
     record = send_record(args.socket, args.id)
-    pane = record.get("pane") if record else resolve_pane(args.socket, args.id)
+    if record is None:
+        pane, server = resolve_target(args.socket, args.id)
+    else:
+        pane, server = record.get("pane"), record.get("tmux")
     if not pane:
         die(f"'{args.id}' has no pane")
-    lock = send_lock(args.socket, pane)
+    lock = send_lock(args.socket, pane, server)
     acknowledged = None
     try:
         if args.no_verify:
-            send_text(pane, text, args.no_enter)
+            send_text(pane, text, args.no_enter, server) if server else \
+                send_text(pane, text, args.no_enter)
             verified = False
         else:
             def baseline():
@@ -1586,18 +1664,25 @@ def cmd_send(args):
                 if args.ack:
                     record = send_record(args.socket, args.id)
 
-            result = verified_send(pane, text, args.settle, baseline)
+            if server:
+                result = verified_send(pane, text, args.settle, baseline, server)
+            else:
+                result = verified_send(pane, text, args.settle, baseline)
             verified = result == "sent"
-            if result == "no-input" and pane_is_shell(pane):
+            at_shell = (pane_is_shell(pane, server) if server
+                        else pane_is_shell(pane))
+            if result == "no-input" and at_shell:
                 # a bare shell has no input box to detect; type the line
-                send_text(pane, text, args.no_enter)
+                send_text(pane, text, args.no_enter, server) if server else \
+                    send_text(pane, text, args.no_enter)
                 verified = False
                 print(f"herdlet: {args.id} is at a shell; sent unverified",
                       file=sys.stderr)
             elif result == "no-input":
                 print(f"herdlet: no input box on {args.id}; nothing typed",
                       file=sys.stderr)
-                for line in pane_tail(capture_pane(pane)):
+                for line in pane_tail(capture_pane(pane, server) if server
+                                      else capture_pane(pane)):
                     print(line, file=sys.stderr)
                 return EXIT_NO_INPUT
             elif result == "draft":
@@ -1706,9 +1791,10 @@ def cmd_peek(args):
     lines = max(1, lines)
     if args.transcript:
         return peek_transcript(args, lines)
-    pane = resolve_pane(args.socket, args.id)
+    pane, server = resolve_target(args.socket, args.id)
     flags = ["-p", "-J"] if args.join else ["-p"]
-    out = tmux("capture-pane", *flags, "-t", pane, "-S", f"-{lines}", check=True)
+    out = tmux(*tmux_server_args(server), "capture-pane", *flags, "-t", pane,
+               "-S", f"-{lines}", check=True)
     print(out.rstrip("\n"))
 
 
@@ -1981,6 +2067,7 @@ def cmd_spawn(args):
     ensure_daemon(args.socket)
     params = {"id": args.id, "agent": args.agent, "pane": pane, "cwd": cwd,
               "model": args.model, "effort": args.effort,
+              "tmux": tmux_socket(),
               "message": f"spawning: {title}"}
     if args.agent == "codex" or not spawn_ready(args.socket, args.id, pane):
         params["state"] = "spawning"  # else a hook beat us here; don't undo it
@@ -2154,8 +2241,9 @@ def pane_tail(capture, lines=5):
     return [line.strip() for line in capture.splitlines() if line.strip()][-lines:]
 
 
-def show_tail(pane, lines):
-    out = tmux("capture-pane", "-p", "-t", pane, "-S", f"-{lines}", check=True)
+def show_tail(pane, lines, server=None):
+    out = tmux(*tmux_server_args(server), "capture-pane", "-p", "-t", pane,
+               "-S", f"-{lines}", check=True)
     print((out or "").rstrip("\n"))
 
 
@@ -2204,13 +2292,15 @@ def cmd_resume(args):
     pane = args.pane or rec.get("pane")
     if not pane:
         die(f"'{args.id}' has no pane; spawn one and pass --pane %N")
-    current = (tmux("display-message", "-p", "-t", pane, "#{pane_current_command}") or "").strip()
+    server = tmux_server_args(rec.get("tmux"))
+    current = (tmux(*server, "display-message", "-p", "-t", pane,
+                    "#{pane_current_command}") or "").strip()
     if not args.force and current and current not in SHELLS:
         die(f"pane {pane} is running '{current}', not a bare shell; pass --force to type anyway")
     cmd = template.format(session=shlex.quote(session))
-    tmux("send-keys", "-t", pane, "-l", "--", cmd, check=True)
+    tmux(*server, "send-keys", "-t", pane, "-l", "--", cmd, check=True)
     time.sleep(0.2)
-    tmux("send-keys", "-t", pane, "Enter", check=True)
+    tmux(*server, "send-keys", "-t", pane, "Enter", check=True)
     print(f"resume sent to {pane}: {cmd}")
 
 
@@ -2218,8 +2308,9 @@ def cmd_approve(args):
     if args.option is not None and not (
             len(args.option) == 1 and args.option.isdigit()):
         die("--option must be a single digit menu key")
-    pane = resolve_pane(args.socket, args.id)
-    capture = tmux("capture-pane", "-p", "-J", "-t", pane, check=True) or ""
+    pane, server = resolve_target(args.socket, args.id)
+    capture = tmux(*tmux_server_args(server), "capture-pane", "-p", "-J",
+                   "-t", pane, check=True) or ""
     if not pane_has_menu(capture):
         try:
             record = call(args.socket, "agent.get", {"id": args.id}).get("result")
@@ -2250,7 +2341,8 @@ def cmd_approve(args):
         record = call(args.socket, "agent.get", {"id": args.id}).get("result")
     except OSError:
         record, report_failed = None, True
-    tmux("send-keys", "-t", pane, option, check=True)  # bare keypress: menus react without Enter
+    tmux(*tmux_server_args(server), "send-keys", "-t", pane, option,
+         check=True)  # bare keypress: menus react without Enter
     try:
         if record is not None:
             call(args.socket, "agent.report", {
@@ -2263,12 +2355,12 @@ def cmd_approve(args):
     time.sleep(args.settle)
 
     if not args.wait:
-        show_tail(pane, args.lines)
+        show_tail(pane, args.lines, server)
         return 0
 
     if report_failed:
         # approve's core job (the keypress) already happened; don't fail after the side effect
-        show_tail(pane, args.lines)
+        show_tail(pane, args.lines, server)
         return 0
 
     states = [s.strip() for s in args.state.split(",") if s.strip()]
@@ -2283,11 +2375,11 @@ def cmd_approve(args):
     except TimeoutError:  # hung daemon: still a failure, whatever --timeout-ok says
         state, hung = "timeout", True
     except OSError:
-        show_tail(pane, args.lines)
+        show_tail(pane, args.lines, server)
         return 0
 
     print(f"state: {state}")
-    show_tail(pane, args.lines)
+    show_tail(pane, args.lines, server)
     if state != "timeout":
         return 0
     return 0 if args.timeout_ok and not hung else EXIT_TIMEOUT
@@ -2343,9 +2435,13 @@ def draw(agents, note):
     sys.stdout.flush()
 
 
-def jump(rec, panes):
+def jump(rec, maps):
     pane = rec.get("pane")
-    info = panes.get(pane) if pane else None
+    here = tmux_socket()
+    server = rec.get("tmux") or here
+    if server != here:
+        return False  # this client's server cannot switch to another one
+    info = (maps.get(server) or {}).get(pane) if pane else None
     if not info:
         return False
     tmux("switch-client", "-t", info["session"])
@@ -2412,9 +2508,9 @@ def _monitor_session(sock_path, stdin_fd, session=None, prefix=None):
         nonlocal agents
         try:
             resp = call(sock_path, "agent.list", {}, timeout=2.0)
-            agents = filter_agents(
-                annotate(resp.get("result", {}).get("agents", []), pane_map()),
-                session, prefix=prefix)
+            raw = resp.get("result", {}).get("agents", [])
+            agents = filter_agents(annotate(raw, None, pane_maps(raw)),
+                                   session, prefix=prefix)
         except OSError:
             pass
         draw(agents, "")
@@ -2430,7 +2526,7 @@ def _monitor_session(sock_path, stdin_fd, session=None, prefix=None):
                     if ch in QUIT_KEYS:
                         return False
                     if ch.isdigit() and 0 < int(ch) <= len(agents):
-                        if jump(agents[int(ch) - 1], pane_map()):
+                        if jump(agents[int(ch) - 1], pane_maps(agents)):
                             return False
                 else:
                     if not conn.recv(4096):

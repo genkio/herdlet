@@ -424,6 +424,13 @@ class HerdletTest(unittest.TestCase):
         proc = self.run_cli("serve", "--if-needed")
         self.assertEqual(proc.returncode, 0)
 
+    def test_a_report_carries_the_tmux_server(self):
+        env = {"TMUX": "/tmp/tmux-501/default,1,0", "TMUX_PANE": "%1"}
+        self.parse(self.run_cli("report", "--id", "ts1", "--state", "idle",
+                                env_extra=env))
+        rec = self.parse(self.run_cli("get", "--id", "ts1"))["result"]
+        self.assertEqual(rec["tmux"], "/tmp/tmux-501/default")
+
     def test_list_prefix_filter(self):
         self.parse(self.run_cli("report", "--id", "px/one", "--state", "idle"))
         self.parse(self.run_cli("report", "--id", "px-other", "--state", "idle"))
@@ -1316,6 +1323,17 @@ class LimitSweepTest(unittest.TestCase):
         # print about it
         self.assertIsNone(_load_module().LIMIT_RE)
 
+    def test_the_sweep_reads_each_record_on_its_own_server(self):
+        self.bus.agents["w"]["tmux"] = "/a"
+        seen = []
+        self.sweep(lambda pane, server=None: seen.append((pane, server)) or "")
+        self.assertEqual(seen, [("%1", "/a")])
+
+    def test_a_record_without_a_server_uses_the_plain_capture(self):
+        seen = []
+        self.sweep(lambda pane, server=None: seen.append((pane, server)) or "")
+        self.assertEqual(seen, [("%1", None)])
+
     def test_limited_wakes_waiters(self):
         woken = []
         self.bus.waiters.append(
@@ -1724,9 +1742,9 @@ class SendCommandTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.record = None
         self.h.send_record = lambda socket, agent_id: self.record
-        self.h.resolve_pane = lambda socket, agent_id: "%4"
+        self.h.resolve_target = lambda socket, agent_id: ("%4", None)
         self.h.peer_scope = lambda socket, agent_id: (None, None)
-        self.h.pane_is_shell = lambda pane: False
+        self.h.pane_is_shell = lambda pane, server=None: False
 
     def args(self, **kw):
         base = dict(socket=os.path.join(self.tmp.name, "h.sock"), id="%4",
@@ -1780,9 +1798,17 @@ class SendCommandTest(unittest.TestCase):
         self.assertIn("no input box on %4; nothing typed", err.getvalue())
         self.assertIn("Press enter to confirm or esc to cancel", err.getvalue())
 
+    def test_send_uses_the_records_server(self):
+        self.record = {"pane": "%4", "updated": 10, "tmux": "/a"}
+        seen = []
+        self.h.verified_send = lambda pane, text, settle, before, server: \
+            seen.append((pane, server)) or "sent"
+        self.assertEqual(self.h.cmd_send(self.args()), 0)
+        self.assertEqual(seen, [("%4", "/a")])
+
     def test_shell_pane_falls_back_to_an_unverified_send(self):
         self.h.verified_send = lambda pane, text, settle, before: "no-input"
-        self.h.pane_is_shell = lambda pane: True
+        self.h.pane_is_shell = lambda pane, server=None: True
         sent = []
         self.h.send_text = lambda pane, text, no_enter: sent.append(
             (pane, text, no_enter))
@@ -1795,7 +1821,7 @@ class SendCommandTest(unittest.TestCase):
 
     def test_a_tui_without_an_input_box_still_exits_six(self):
         self.h.verified_send = lambda pane, text, settle, before: "no-input"
-        self.h.pane_is_shell = lambda pane: False
+        self.h.pane_is_shell = lambda pane, server=None: False
         sent = []
         self.h.send_text = lambda pane, text, no_enter: sent.append(pane)
         err = io.StringIO()
@@ -2539,6 +2565,23 @@ class PaneKillGuardTest(unittest.TestCase):
     def test_live_nonterminal_agent_is_refused(self):
         self.assertFalse(self.h.pane_kill_allowed({"state": "working"}, "node"))
 
+    def test_the_kill_goes_to_the_records_server(self):
+        calls = []
+
+        def tmux(*args, **kw):
+            calls.append(args)
+            if "display-message" in args:
+                return "%4\tnode\n"
+            return ""
+
+        self.h.tmux = tmux
+        killed = self.h.kill_record_pane(
+            "worker/a", {"state": "done", "pane": "%4", "tmux": "/a"})
+        self.assertTrue(killed)
+        self.assertEqual([args[:3] for args in calls],
+                         [("-S", "/a", "display-message"),
+                          ("-S", "/a", "kill-pane")])
+
     def test_vanished_pane_does_not_abort_the_batch(self):
         def tmux(*args, **kw):
             if args[0] == "display-message":
@@ -2667,6 +2710,96 @@ class TranscriptParseTest(unittest.TestCase):
                                                       "content": "hi"}}) + "\n")
         self.assertEqual(self.h.transcript_messages(path, 5),
                          [(None, "plain"), ("t2", "codex")])
+
+
+class TmuxServerTest(unittest.TestCase):
+    """Pane ids repeat across tmux servers, so a record carries its server."""
+
+    def setUp(self):
+        self.h = _load_module()
+
+    def test_socket_is_parsed_from_tmux_env(self):
+        saved = self.h.os.environ.get("TMUX")
+        self.h.os.environ["TMUX"] = "/tmp/tmux-501/default,123,0"
+        try:
+            self.assertEqual(self.h.tmux_socket(), "/tmp/tmux-501/default")
+        finally:
+            self._restore(saved)
+
+    def test_no_tmux_env_means_no_server(self):
+        saved = self.h.os.environ.pop("TMUX", None)
+        try:
+            self.assertIsNone(self.h.tmux_socket())
+        finally:
+            self._restore(saved)
+
+    def test_server_args_are_empty_without_a_server(self):
+        self.assertEqual(self.h.tmux_server_args(None), ())
+        self.assertEqual(self.h.tmux_server_args("/a"), ("-S", "/a"))
+
+    def _restore(self, saved):
+        if saved is None:
+            self.h.os.environ.pop("TMUX", None)
+        else:
+            self.h.os.environ["TMUX"] = saved
+
+
+class PaneMapsTest(unittest.TestCase):
+    """A record is annotated against the panes of its own tmux server."""
+
+    def setUp(self):
+        self.h = _load_module()
+        self.listing = {"/a": "%3\twork\t@1\t1\twin\tzsh\n",
+                        "/b": "%3\twork\t@1\t1\twin\tnode\n"}
+
+    def fake_tmux(self, *args, **kw):
+        server = args[1] if args and args[0] == "-S" else None
+        return self.listing.get(server, "")
+
+    def rec(self, pane, server, updated_ago=0.0):
+        return {"id": f"{server}{pane}", "state": "working", "pane": pane,
+                "tmux": server, "updated": time.time() - updated_ago,
+                "message": "", "agent": "claude", "session": "s", "cwd": "/tmp"}
+
+    def test_each_record_gets_its_own_servers_pane_listing(self):
+        self.h.tmux = self.fake_tmux
+        old = self.h.STALE_AFTER + 30
+        agents = [self.rec("%3", "/a", old), self.rec("%3", "/b", old)]
+        states = {rec["id"]: rec["state"]
+                  for rec in self.h.annotate(agents, None,
+                                             self.h.pane_maps(agents))}
+        # same pane id, different server: /a's pane is a shell and the record
+        # is quiet, /b's is the live agent
+        self.assertEqual(states, {"/a%3": "stale", "/b%3": "working"})
+
+    def test_a_pane_id_from_another_server_is_not_a_match(self):
+        self.h.tmux = self.fake_tmux
+        self.listing["/a"] = "%9\twork\t@1\t1\twin\tnode\n"
+        self.listing["/b"] = "%3\twork\t@1\t1\twin\tnode\n"
+        agents = [self.rec("%3", "/a")]
+        out = self.h.annotate(agents, None, self.h.pane_maps(agents))
+        self.assertEqual(out[0]["state"], "gone")
+
+
+class ResolveTargetTest(unittest.TestCase):
+    def setUp(self):
+        self.h = _load_module()
+
+    def test_a_record_yields_pane_and_server(self):
+        self.h.call = lambda sock, method, params, timeout=5.0: {
+            "result": {"id": "x", "pane": "%7", "tmux": "/a"}}
+        self.assertEqual(self.h.resolve_target("s", "x"), ("%7", "/a"))
+
+    def test_a_raw_pane_id_has_no_server(self):
+        self.h.call = lambda sock, method, params, timeout=5.0: {
+            "error": {"code": "not_found"}}
+        self.assertEqual(self.h.resolve_target("s", "%9"), ("%9", None))
+
+    def test_an_unknown_agent_dies(self):
+        self.h.call = lambda sock, method, params, timeout=5.0: {
+            "error": {"code": "not_found"}}
+        with self.assertRaises(SystemExit):
+            self.h.resolve_target("s", "nope")
 
 
 class InstanceTest(unittest.TestCase):

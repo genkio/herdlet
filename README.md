@@ -465,11 +465,22 @@ started *after* the agent was already blocked still wakes instead of starving.
 
 Report merge semantics: absent/null fields preserve the previous value, empty
 string clears (merge keys: `message`, `agent`, `pane`, `cwd`, `session`,
-`transcript`, `model`, `effort`). Tool-use hooks report `message: null`, which
-is why the prompt survives as the message for the whole turn. `compacts` is a
-daemon-side counter, bumped by `{"compact": true}` reports. `peers` / `topics`
-are owned by `agent.pair`, never by a report, and default to `[]` / `{}` on a
-record written by an older daemon.
+`transcript`, `model`, `effort`, `tmux`). Tool-use hooks report `message: null`,
+which is why the prompt survives as the message for the whole turn. `compacts`
+is a daemon-side counter, bumped by `{"compact": true}` reports. `peers` /
+`topics` are owned by `agent.pair`, never by a report, and default to `[]` /
+`{}` on a record written by an older daemon.
+
+`tmux` is the tmux server socket the pane lives on (from `$TMUX`). Pane ids
+repeat across tmux servers, so every pane operation on a record uses that
+record's server: the `limited` sweep, `list` / `monitor` annotation, `peek`,
+`wait --match`, `send`, `approve`, `resume` and `--kill-pane`. A daemon started
+from one server no longer reads or types into the same-numbered pane of another
+one, and `list` from a different server no longer shows those agents as `gone`.
+Records written before this key existed fall back to the local server, the only
+one a pre-fix daemon could have reported from. `wait` also pins the occupant
+instance it started on, so a re-registered id (same name, new pane) cannot
+satisfy an older waiter.
 
 Environment: `HERDLET_SOCKET`, `HERDLET_ID`, `HERDLET_SKIP`,
 `HERDLET_BLOCKED_REEMIT`, `HERDLET_MAX_AGE`, `HERDLET_PRUNE_INTERVAL`,
