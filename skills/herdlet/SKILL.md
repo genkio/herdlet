@@ -183,8 +183,22 @@ git diff | herdlet send --id builder --file -        # or from stdin
 ```
 
 the text is typed into that agent's terminal and submitted with Enter, as if
-its human had typed it. if the target agent is mid-turn, the message queues
-like normal user input. use `--no-enter` to type without submitting.
+its human had typed it. sends to one pane are serialized. `send` waits up to
+five seconds for existing input to clear before it types. if the input stays,
+it sends the message and writes a warning to stderr.
+
+if the target agent is mid-turn, the message queues as normal user input.
+
+after Enter, `send` makes sure that the input box is empty. it sends Enter one
+more time if the text remains. if the second attempt fails, it exits 4 and
+leaves the text in the prompt. use `--settle SECONDS` to change both wait times.
+
+pass `--ack` to wait for the target hook to record the prompt and the `working`
+state. an unregistered pane has no hooks, so `send` skips this wait and writes a
+note. pass `--json` to print the send result.
+
+pass `--no-verify` for the old fire-and-forget behavior. `--no-enter` requires
+`--no-verify` and types without submission.
 
 if YOU are a worker (`$HERDLET_ID` is set), `send` only reaches your peers - the
 agents the master paired you with, plus any worker you spawned yourself.
@@ -370,6 +384,8 @@ downgrade mechanical roles explicitly, with a model id valid for YOUR setup:
 high effort/thinking settings multiply output tokens on every turn of that
 worker's life, so reserve them for genuinely hard design work, never for
 mechanical roles.
+
+Claude Code 2.1.263 can show `medium` in its footer although herdlet passes a different `--effort` value.
 
 **provision permissions at spawn time.** an unattended worker that hits a
 permission menu just sits there until someone presses a key; a worker that

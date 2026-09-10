@@ -97,12 +97,25 @@ which still fails.
 Agent ids resolve from `--id`, then `$HERDLET_ID`, then `$TMUX_PANE`. Name an
 agent by launching it with an env var: `HERDLET_ID=builder claude`.
 
-`send` types short text with `tmux send-keys`, and routes anything multi-line or
-over 200 characters through a bracketed paste instead, so the receiving TUI gets
-one atomic block and cannot submit half of it. Note that a pane sitting at a
-plain shell (not an agent TUI) is in canonical tty mode, where the kernel drops
-any single input line over 1023 characters whichever way it is delivered; agent
-TUIs read in raw mode and are not affected.
+`send` serializes messages for each target pane. It waits up to five seconds for
+existing input to clear before it types. If the input stays, it sends the message
+and writes a warning to stderr.
+
+After Enter, `send` makes sure that the input box is empty. It sends Enter one
+more time if the text remains. If the second attempt fails, `send` exits 4 and
+leaves the text in the prompt. Use `--settle SECONDS` to change both wait times.
+
+Pass `--ack` to wait for the target hook to record the prompt and the `working`
+state. An unregistered pane has no hooks, so `send` skips this wait and writes a
+note. Pass `--json` to print the send result.
+
+Pass `--no-verify` for the old fire-and-forget behavior. The `--no-enter` flag
+requires `--no-verify` and types without submission.
+
+Short text uses `tmux send-keys`. Text that is multi-line or more than 200
+characters uses one bracketed paste. Thus, the receiving TUI cannot submit half
+of the text. A plain shell uses canonical tty mode and drops an input line over
+1023 characters. Agent TUIs use raw mode and do not have this limit.
 
 ## Automatic state from Claude Code / Codex hooks
 

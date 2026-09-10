@@ -1309,6 +1309,250 @@ class SendRoutingTest(unittest.TestCase):
         self.assertEqual(self.verbs(), ["send-keys"])
 
 
+CLAUDE_EMPTY_PANE = """\
+ ▐▛███▛█   Claude Code v2.1.263
+▝▜██████▀  Haiku 4.5 · Claude Team
+  ▝▝ ▝▝    ~/code/herdlet
+
+
+───────────────────────────────────────────── probe/fixtures-claude: fixtures ─
+❯ 
+───────────────────────────────────────────────────────────────────────────────
+  haiku-4-5-20251001 (medium) · 0k/200k (0%) · ~/code/herdlet · main
+  -- INSERT -- ⏸ manual mode on · ← for agents
+"""
+
+CLAUDE_PENDING_PANE = """\
+ ▐▛███▛█   Claude Code v2.1.263
+▝▜██████▀  Haiku 4.5 · Claude Team
+  ▝▝ ▝▝    ~/code/herdlet
+
+
+───────────────────────────────────────────── probe/fixtures-claude: fixtures ─
+❯ pending claude fixture
+───────────────────────────────────────────────────────────────────────────────
+  haiku-4-5-20251001 (medium) · 0k/200k (0%) · ~/code/herdlet · main
+  -- INSERT -- ⏸ manual mode on
+"""
+
+CLAUDE_PERMISSION_PANE = """\
+───────────────────────────────────────────────────────────────────────────────
+ Fetch
+
+   url: https://example.com/
+   prompt: What is the title of this page?
+   Claude wants to fetch content from example.com
+
+ Do you want to allow Claude to fetch this content?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for example.com
+   3. No, and tell Claude what to do differently (esc)
+"""
+
+CODEX_EMPTY_PANE = """\
+  Tip: New Use /fast to enable our fastest inference with increased plan usage.
+
+• You have 1 usage limit reset available. Run /usage to use one.
+
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol low · ~/code/herdlet
+"""
+
+CODEX_PENDING_PANE = """\
+  Tip: New Use /fast to enable our fastest inference with increased plan usage.
+
+• You have 1 usage limit reset available. Run /usage to use one.
+
+
+› pending codex fixture
+
+  gpt-5.6-sol low · ~/code/herdlet
+"""
+
+CODEX_MENU_PANE = """\
+  Select Model and Effort
+  Access legacy models by running codex -m <model_name> or in your config.tom
+
+  1. gpt-6-astra (default)  Our most capable model for complex, demanding
+                            work.
+› 2. gpt-5.6-sol (current)  Reliable agentic workhorse for everyday tasks.
+  3. gpt-5.6-terra          Balanced agentic coding model for everyday work.
+  4. gpt-5.6-luna           Fast and affordable agentic coding model.
+  5. gpt-5.5                Proven previous-generation model for coding and
+                            general work.
+
+  Press enter to confirm or esc to go back
+"""
+
+
+class PaneInputTextTest(unittest.TestCase):
+    def setUp(self):
+        self.h = _load_module()
+
+    def test_live_prompt_fixtures(self):
+        cases = (
+            (CLAUDE_EMPTY_PANE, ""),
+            (CLAUDE_PENDING_PANE, "pending claude fixture"),
+            (CLAUDE_PERMISSION_PANE, None),
+            (CODEX_EMPTY_PANE, ""),
+            (CODEX_PENDING_PANE, "pending codex fixture"),
+            (CODEX_MENU_PANE, None),
+        )
+        for capture, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(self.h.pane_input_text(capture + "\n" * 20),
+                                 expected)
+
+
+class VerifiedSendTest(unittest.TestCase):
+    def setUp(self):
+        self.h = _load_module()
+        self.sent = []
+        self.keys = []
+        self.h.send_text = lambda pane, text: self.sent.append((pane, text))
+        self.h.tmux = lambda *args, **kw: self.keys.append(args) or ""
+
+    def captures(self, values):
+        items = iter(values)
+        self.h.capture_pane = lambda pane: next(items)
+
+    def test_retries_enter_once_when_text_stays_in_the_prompt(self):
+        self.captures((CODEX_EMPTY_PANE, CODEX_PENDING_PANE, CODEX_EMPTY_PANE))
+        self.assertEqual(
+            self.h.verified_send("%1", "pending codex fixture", 0),
+            (True, True))
+        self.assertEqual(self.sent, [("%1", "pending codex fixture")])
+        self.assertEqual(self.keys, [("send-keys", "-t", "%1", "Enter")])
+
+    def test_reports_failure_after_the_second_check(self):
+        self.captures((CODEX_EMPTY_PANE, CODEX_PENDING_PANE, CODEX_PENDING_PANE))
+        self.assertEqual(
+            self.h.verified_send("%1", "pending codex fixture", 0),
+            (True, False))
+
+    def test_sends_after_the_existing_input_does_not_clear(self):
+        self.captures((CLAUDE_PENDING_PANE, CLAUDE_EMPTY_PANE))
+        self.assertEqual(
+            self.h.verified_send("%1", "another message", 0),
+            (False, True))
+
+
+class SendLockTest(unittest.TestCase):
+    def test_two_sends_to_one_pane_do_not_interleave(self):
+        h = _load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = os.path.join(directory, "herdlet.sock")
+            first_locked = threading.Event()
+            release_first = threading.Event()
+            order = []
+
+            def hold(label, wait=False):
+                lock = h.send_lock(socket_path, "%7")
+                try:
+                    order.append(label + " start")
+                    if wait:
+                        first_locked.set()
+                        release_first.wait(2)
+                    order.append(label + " end")
+                finally:
+                    lock.close()
+
+            first = threading.Thread(target=hold, args=("first", True))
+            second = threading.Thread(target=hold, args=("second",))
+            first.start()
+            self.assertTrue(first_locked.wait(1))
+            second.start()
+            time.sleep(0.05)
+            self.assertEqual(order, ["first start"])
+            release_first.set()
+            first.join(2)
+            second.join(2)
+            self.assertEqual(order, [
+                "first start", "first end", "second start", "second end"])
+
+
+class SendCommandTest(unittest.TestCase):
+    def setUp(self):
+        self.h = _load_module()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.record = None
+        self.h.send_record = lambda socket, agent_id: self.record
+        self.h.resolve_pane = lambda socket, agent_id: "%4"
+        self.h.peer_scope = lambda socket, agent_id: (None, None)
+
+    def args(self, **kw):
+        base = dict(socket=os.path.join(self.tmp.name, "h.sock"), id="%4",
+                    text=["hello"], file=None, no_enter=False, settle=0,
+                    ack=False, no_verify=False, json=False)
+        base.update(kw)
+        return _Args(**base)
+
+    def test_unsubmitted_text_exits_four_and_stays_in_the_prompt(self):
+        self.h.verified_send = lambda pane, text, settle: (True, False)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = self.h.cmd_send(self.args())
+        self.assertEqual(code, 4)
+        self.assertIn("send to %4 not submitted; text is sitting in its prompt",
+                      err.getvalue())
+
+    def test_ack_is_skipped_for_an_unregistered_pane(self):
+        self.h.verified_send = lambda pane, text, settle: (True, True)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = self.h.cmd_send(self.args(ack=True))
+        self.assertEqual(code, 0)
+        self.assertIn("has no hook record; skipped ack", err.getvalue())
+
+    def test_ack_timeout_exits_four(self):
+        self.record = {"pane": "%4", "updated": 10}
+        self.h.verified_send = lambda pane, text, settle: (True, True)
+        self.h.wait_for_send_ack = lambda *args: False
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = self.h.cmd_send(self.args(ack=True))
+        self.assertEqual(code, 4)
+        self.assertIn("no hook acknowledgment arrived", err.getvalue())
+
+    def test_pending_input_writes_a_warning_but_still_succeeds(self):
+        self.h.verified_send = lambda pane, text, settle: (False, True)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = self.h.cmd_send(self.args(settle=2))
+        self.assertEqual(code, 0)
+        self.assertIn("did not clear within 2s; sending anyway", err.getvalue())
+
+    def test_no_verify_uses_the_old_send_path(self):
+        sent = []
+        self.h.send_text = lambda pane, text, no_enter: sent.append(
+            (pane, text, no_enter))
+        self.assertEqual(
+            self.h.cmd_send(self.args(no_verify=True, no_enter=True)), 0)
+        self.assertEqual(sent, [("%4", "hello", True)])
+
+    def test_no_enter_requires_no_verify(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as exc:
+            self.h.cmd_send(self.args(no_enter=True))
+        self.assertEqual(exc.exception.code, 1)
+        self.assertIn("--no-enter requires --no-verify", err.getvalue())
+
+    def test_json_describes_a_verified_acknowledged_send(self):
+        self.record = {"pane": "%4", "updated": 10}
+        self.h.verified_send = lambda pane, text, settle: (True, True)
+        self.h.wait_for_send_ack = lambda *args: True
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = self.h.cmd_send(self.args(ack=True, json=True))
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue())["result"], {
+            "type": "sent", "id": "%4", "pane": "%4",
+            "verified": True, "acknowledged": True})
+
+
 class SpawnLineTest(unittest.TestCase):
     def setUp(self):
         self.h = _load_module()

@@ -14,6 +14,7 @@ size. Pane I/O (send text, read scrollback) is delegated to tmux itself.
 
 import argparse
 import asyncio
+import fcntl
 import json
 import os
 import re
@@ -1158,6 +1159,52 @@ def cmd_hook(args):
 # and gets submitted in half. A bracketed paste is one atomic block, so route
 # anything long that way; it also sidesteps tmux's 16 KiB command-line ceiling.
 SEND_PASTE_OVER = 200
+SEND_POLL_INTERVAL = 0.1
+
+
+def pane_input_text(capture):
+    """Pending TUI input, '' for an empty box, or None when no box is visible."""
+    lines = capture.replace("\u00a0", " ").splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    for index in range(len(lines) - 1, max(-1, len(lines) - 13), -1):
+        match = re.match(r"^\s*([>❯›])\s*(.*?)\s*$", lines[index])
+        if not match:
+            continue
+        marker, first = match.groups()
+        if re.match(r"\d+\.\s", first):
+            return None
+        if marker == "›" and first.lower() == "ask codex to do anything":
+            return ""
+        parts = [first] if first else []
+        for line in lines[index + 1:]:
+            stripped = line.strip()
+            if not stripped or re.fullmatch(r"─+", stripped):
+                break
+            parts.append(stripped)
+        return "\n".join(parts)
+    return None
+
+
+def wait_for_empty_input(pane, settle):
+    deadline = time.monotonic() + max(0, settle)
+    while True:
+        pending = pane_input_text(capture_pane(pane))
+        if not pending:
+            return pending
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return pending
+        time.sleep(min(SEND_POLL_INTERVAL, remaining))
+
+
+def send_lock(sock_path, pane):
+    state_dir = sock_path + ".state.d"
+    os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", pane)
+    lock = open(os.path.join(state_dir, f"send-{name}.lock"), "a+")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    return lock
 
 
 def send_text(pane, text, no_enter=False):
@@ -1171,6 +1218,17 @@ def send_text(pane, text, no_enter=False):
     if not no_enter:
         time.sleep(0.2)  # let the TUI ingest the text before submit
         tmux("send-keys", "-t", pane, "Enter", check=True)
+
+
+def verified_send(pane, text, settle):
+    pending = wait_for_empty_input(pane, settle)
+    quiesced = not bool(pending)
+    send_text(pane, text)
+    pending = wait_for_empty_input(pane, settle)
+    if pending:
+        tmux("send-keys", "-t", pane, "Enter", check=True)
+        pending = wait_for_empty_input(pane, settle)
+    return quiesced, not bool(pending)
 
 
 THREAD_HEADING = "## Thread"
@@ -1243,6 +1301,28 @@ def record_peer_send(sock_path, from_id, to_id, topic, text):
               file=sys.stderr)
 
 
+def send_record(sock_path, agent_id):
+    try:
+        return call(sock_path, "agent.get", {"id": agent_id}).get("result")
+    except OSError:
+        return None
+
+
+def wait_for_send_ack(sock_path, agent_id, text, updated, settle):
+    deadline = time.monotonic() + max(0, settle)
+    expected = squash(text)
+    while True:
+        record = send_record(sock_path, agent_id)
+        if (record and record.get("state") == "working"
+                and record.get("message") == expected
+                and record.get("updated", 0) > updated):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(SEND_POLL_INTERVAL, remaining))
+
+
 def cmd_send(args):
     if args.text and args.file:
         die("pass either positional text or --file PATH ('-' for stdin), not both")
@@ -1259,10 +1339,54 @@ def cmd_send(args):
     if not text:
         die(f"nothing to send: {args.file} is empty" if args.file
             else "nothing to send: the message is empty")
+    if args.no_enter and not args.no_verify:
+        die("--no-enter requires --no-verify")
+    if args.ack and args.no_verify:
+        die("--ack requires verification")
+    if args.settle < 0:
+        die("--settle must be zero or more")
     from_id, topic = peer_scope(args.socket, args.id)
-    send_text(resolve_pane(args.socket, args.id), text, args.no_enter)
-    if from_id:
-        record_peer_send(args.socket, from_id, args.id, topic, text)
+    record = send_record(args.socket, args.id)
+    pane = record.get("pane") if record else resolve_pane(args.socket, args.id)
+    if not pane:
+        die(f"'{args.id}' has no pane")
+    lock = send_lock(args.socket, pane)
+    acknowledged = None
+    try:
+        if args.no_verify:
+            send_text(pane, text, args.no_enter)
+            verified = False
+        else:
+            quiesced, verified = verified_send(pane, text, args.settle)
+            if not quiesced:
+                print(f"herdlet: input in {args.id} did not clear within "
+                      f"{args.settle:g}s; sending anyway", file=sys.stderr)
+            if not verified:
+                print(f"herdlet: send to {args.id} not submitted; "
+                      "text is sitting in its prompt", file=sys.stderr)
+                return 4
+        if args.ack:
+            if record is None:
+                print(f"herdlet: send to {args.id} has no hook record; "
+                      "skipped ack", file=sys.stderr)
+                acknowledged = False
+            else:
+                acknowledged = wait_for_send_ack(
+                    args.socket, args.id, text, record.get("updated", 0), args.settle)
+                if not acknowledged:
+                    print(f"herdlet: send to {args.id} was submitted, but no "
+                          "hook acknowledgment arrived", file=sys.stderr)
+                    return 4
+        if from_id:
+            record_peer_send(args.socket, from_id, args.id, topic, text)
+    finally:
+        lock.close()
+    if args.json:
+        print(json.dumps({"result": {
+            "type": "sent", "id": args.id, "pane": pane,
+            "verified": verified, "acknowledged": acknowledged,
+        }}, indent=2))
+    return 0
 
 
 def codex_transcript_message(row):
@@ -1968,6 +2092,13 @@ def main():
     p = sub.add_parser("send", help="type text into an agent's pane (submits with Enter)")
     p.add_argument("--id", required=True, help="agent id or tmux pane id")
     p.add_argument("--no-enter", action="store_true")
+    p.add_argument("--settle", type=float, default=5,
+                   help="seconds to wait for prompt changes (default: 5)")
+    p.add_argument("--ack", action="store_true",
+                   help="wait for the target hook to record the submitted prompt")
+    p.add_argument("--no-verify", action="store_true",
+                   help="send without prompt checks (required with --no-enter)")
+    p.add_argument("--json", action="store_true")
     p.add_argument("--file", help="read the message from PATH ('-' for stdin) "
                                   "instead of the positional text")
     p.add_argument("text", nargs="*")
