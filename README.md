@@ -46,7 +46,7 @@ wiring? The snippets are below.
 
 There is no daemon to babysit: `hook`, `report`, `spawn` and `monitor`
 auto-start it on first use (`herdlet serve` runs it in the foreground if you
-prefer). After upgrading, restart it so the 0.8.0 daemon-side features are
+prefer). After upgrading, restart it so the 0.9.0 daemon-side features are
 served: `pair` / `unpair` and the `peer_send` event, the `limited` sweep, the
 `transcript` / `model` / `effort` merge keys, and the `compacts` counter. Run
 `pkill -f 'herdlet.*serve'` and then any herdlet command; agents re-register on
