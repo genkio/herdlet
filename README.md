@@ -73,7 +73,7 @@ herdlet list --prefix myproject/                 # scope to one project's agents
 herdlet wait --id builder --match 'tests? passed|ERROR' --timeout 600  # wait on pane OUTPUT (plain commands too)
 
 herdlet spawn --id myproject/dev --model sonnet --effort medium --brief plans/dev.md  # new pane, registered from t=0
-herdlet spawn --agent codex --id myproject/review --model gpt-5.6-sol --effort low --sandbox read-only
+herdlet spawn --agent codex --id myproject/review --model gpt-5.6-sol --effort low --sandbox read-only --allow "git status"
 herdlet send --id builder "run the tests again"  # types into builder's pane + Enter
 herdlet send --id builder --file plans/next.md   # long or multi-line message from a file ('-' = stdin)
 herdlet peek --id builder --lines 40             # read builder's recent output (--join unwraps soft wraps)
@@ -243,16 +243,23 @@ herdlet spawn --id personal/herdlet/tester --model haiku  --effort low    --brie
 herdlet spawn --agent codex --id personal/herdlet/review --model gpt-5.6-sol --effort low --sandbox read-only
 ```
 
-`spawn` launches Claude Code by default. Pass `--agent codex` for Codex and
-choose its `--sandbox` (`workspace-write` by default). It splits the caller's
-own pane, builds the launch line, registers the worker as `spawning`, and links
-itself to the worker one way (see "Peer channel"). It waits for a Claude hook
-or the Codex input prompt, then hands the worker its brief. `--model` and
+`spawn` launches Claude Code by default. Pass `--agent codex` for Codex. Its
+default sandbox is `workspace-write`, and its default approval policy is
+`on-request`. Repeat `--allow "<command prefix>"` to add worker commands to the
+allowlist in the worker cwd. `spawn` splits the caller's own pane, builds the
+launch line, registers the worker as `spawning`, and links itself to the worker
+one way (see "Peer channel"). It waits for a Claude hook or the Codex input
+prompt, then hands the worker its brief. `--model` and
 `--effort` are required on purpose: a worker is a
 top-level session, so anything you do not pin explicitly runs on your MAIN
 (priciest) model, and that is the whole cost lever. Other agents (opencode or a
 wrapper that sets a custom endpoint) still launch by hand with
 `tmux split-window`; see the skill for that recipe.
+
+For Codex, `--sandbox danger-full-access --approval never` is the equivalent
+of Claude's `bypassPermissions`. It gives the worker no prompts and no sandbox.
+Git is the only guard. Use this combination only in a disposable worktree or a
+repository you can reset.
 
 then drives the pair with `send` / `wait --state done,blocked,limited` / `peek`,
 relaying between roles and reporting back to you. Hours later, "now genkia"

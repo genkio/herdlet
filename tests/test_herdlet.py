@@ -638,7 +638,13 @@ class HerdletTest(unittest.TestCase):
                             "--effort", "low", "--agent", "codex",
                             "--permission-mode", "auto")
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("use --sandbox and the fixed -a on-request", proc.stderr)
+        self.assertIn("use --sandbox and --approval instead", proc.stderr)
+
+    def test_spawn_rejects_approval_for_claude(self):
+        proc = self.run_cli("spawn", "--id", "x/y", "--model", "opus",
+                            "--effort", "high", "--approval", "never")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("--approval is only valid with --agent codex", proc.stderr)
 
     def test_spawn_outside_tmux_dies(self):
         proc = self.run_cli("spawn", "--id", "x/y", "--model", "opus",
@@ -1338,6 +1344,11 @@ class SpawnLineTest(unittest.TestCase):
                                  "auto", program="codex")
         self.assertIn("--sandbox workspace-write", line)
 
+    def test_codex_launch_line_uses_selected_approval(self):
+        line = self.h.spawn_line("proj/dev", "gpt-5.6-sol", "low", "probe",
+                                 "auto", program="codex", approval="never")
+        self.assertIn("-a never", line)
+
     def test_codex_prompt_matcher(self):
         self.assertTrue(self.h.codex_prompt_ready("Ask Codex to do anything\n"))
         self.assertTrue(self.h.codex_prompt_ready("  › Ask Codex to do anything  \n"))
@@ -1389,6 +1400,64 @@ class SpawnLineTest(unittest.TestCase):
                          "opus/high")
         self.assertEqual(self.h.model_cell({"model": "opus"}), "opus")
         self.assertEqual(self.h.model_cell({}), "")
+
+
+class SpawnAllowlistTest(unittest.TestCase):
+    def setUp(self):
+        self.h = _load_module()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_claude_allowlist_merges_and_is_idempotent(self):
+        directory = os.path.join(self.tmp.name, ".claude")
+        os.makedirs(directory)
+        path = os.path.join(directory, "settings.local.json")
+        with open(path, "w") as fh:
+            json.dump({"keep": True, "permissions": {"allow": ["Read"]}}, fh)
+
+        touched = self.h.write_spawn_allowlist(
+            "claude", self.tmp.name, ["git status", "pnpm test", "git status"])
+        self.assertEqual(touched, path)
+        with open(path) as fh:
+            first = fh.read()
+        self.assertEqual(json.loads(first), {
+            "keep": True,
+            "permissions": {"allow": [
+                "Read", "Bash(git status:*)", "Bash(pnpm test:*)"]},
+        })
+        self.assertIn('\n  "permissions": {\n    "allow": [', first)
+        self.assertTrue(first.endswith("\n"))
+
+        self.assertIsNone(self.h.write_spawn_allowlist(
+            "claude", self.tmp.name, ["git status", "pnpm test"]
+        ))
+        with open(path) as fh:
+            self.assertEqual(fh.read(), first)
+
+    def test_codex_allowlist_appends_argv_rules_and_is_idempotent(self):
+        directory = os.path.join(self.tmp.name, ".codex", "rules")
+        os.makedirs(directory)
+        path = os.path.join(directory, "herdlet.rules")
+        with open(path, "w") as fh:
+            fh.write('prefix_rule(pattern=["rg"], decision="allow")\n')
+
+        touched = self.h.write_spawn_allowlist(
+            "codex", self.tmp.name,
+            ["git status", "git log --format='%h %s'", "git status"])
+        self.assertEqual(touched, path)
+        with open(path) as fh:
+            first = fh.read()
+        self.assertEqual(first.splitlines(), [
+            'prefix_rule(pattern=["rg"], decision="allow")',
+            'prefix_rule(pattern=["git", "status"], decision="allow")',
+            'prefix_rule(pattern=["git", "log", "--format=%h %s"], decision="allow")',
+        ])
+
+        self.assertIsNone(self.h.write_spawn_allowlist(
+            "codex", self.tmp.name, ["git status", "git log --format='%h %s'"]
+        ))
+        with open(path) as fh:
+            self.assertEqual(fh.read(), first)
 
 
 class _Args:
@@ -1464,7 +1533,7 @@ class SpawnCommandTest(_DaemonCase):
                     agent="claude", title=None, brief=None, cwd=None,
                     permission_mode="auto", env=None, vertical=False,
                     ready_timeout=0.5, json=False, program="claude",
-                    program_args=None, sandbox=None)
+                    program_args=None, sandbox=None, approval=None, allow=None)
         base.update(kw)
         return _Args(**base)
 
@@ -1701,6 +1770,13 @@ class ApproveTimeoutTest(_DaemonCase):
         with contextlib.redirect_stdout(out):
             code = self.h.cmd_approve(self.args(**kw))
         return code, out.getvalue()
+
+    def test_approve_marks_the_record_working_without_wait(self):
+        code, out = self.approve(wait=False)
+        record = self.record("ap/one")
+        self.assertEqual(record["state"], "working")
+        self.assertEqual(record["message"], "approved option 1")
+        self.assertEqual(code, 0)
 
     def test_wait_timeout_exits_2_by_default(self):
         code, out = self.approve()

@@ -271,8 +271,11 @@ herdlet spawn --agent codex --id proj/review --model gpt-5.6-sol --effort low --
 - `--title "<purpose>"` names a Claude Code session. for Codex, spawn stores the
   title in the registry message but does not pass it to the launch command.
 - `--permission-mode <mode>` is for Claude Code only (default `auto`).
-  `--sandbox <mode>` is for Codex only (default `workspace-write`); Codex always
-  uses `-a on-request`.
+  `--sandbox <mode>` and `--approval <on-request|never>` are for Codex only.
+  their defaults are `workspace-write` and `on-request`.
+- repeat `--allow "<command prefix>"` to add commands to the worker's allowlist.
+  Claude entries go in `.claude/settings.local.json`. Codex entries go in
+  `.codex/rules/herdlet.rules`; Codex loads project rules after it trusts the cwd.
 - other flags: `--cwd DIR`, `--vertical`, `--env K=V` (repeatable),
   `--ready-timeout SECONDS` (default 30), `--json`.
 - exit 0 = the pane is up. either the worker registered and got its brief, or it
@@ -371,8 +374,14 @@ mechanical roles.
 **provision permissions at spawn time.** an unattended worker that hits a
 permission menu just sits there until someone presses a key; a worker that
 prompts on every shell command turns you into a full-time babysitter. make
-the menus not appear, using your harness's own permission mechanism. for
-Claude Code:
+the menus not appear, using your harness's own permission mechanism.
+
+`herdlet spawn --allow "pnpm test"` pre-seeds one command prefix. repeat the
+flag for each prefix. Claude uses `Bash(<prefix>:*)` entries. Codex uses
+[`prefix_rule`](https://learn.chatgpt.com/docs/agent-configuration/rules.md)
+entries in the trusted project layer.
+
+for Claude Code:
 
 - pre-seed the allowlist in the worker's cwd before spawning: add the command
   shapes the role will need (`Bash(pnpm *)`, `Bash(docker *)`, ...) to
@@ -385,6 +394,11 @@ Claude Code:
 command still prompts.) other harnesses have their own allowlist/sandbox
 flags - check `$LAUNCH --help`. answering menus by hand (see "unblock a
 worker") is the exception path, not the loop.
+
+for Codex, `--sandbox danger-full-access --approval never` is equivalent to
+Claude's `bypassPermissions`. it gives the worker no prompts and no sandbox.
+git is the only guard. use this combination only in a disposable worktree or a
+repository you can reset.
 
 **pre-registration blind spot (hand-built panes only).** keep the pane id
 `split-window -P` printed you; until the worker's first hook event it has no

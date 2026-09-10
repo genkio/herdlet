@@ -1362,7 +1362,8 @@ def brief_title(path):
 
 
 def spawn_line(agent_id, model, effort, title, permission_mode,
-               env=(), program="claude", program_args=(), sandbox=None):
+               env=(), program="claude", program_args=(), sandbox=None,
+               approval=None):
     parts = list(SPAWN_ENV) + [f"HERDLET_ID={shlex.quote(agent_id)}"]
     for pair in env:
         key, sep, value = pair.partition("=")
@@ -1380,7 +1381,7 @@ def spawn_line(agent_id, model, effort, title, permission_mode,
                   "-m", shlex.quote(model),
                   "-c", shlex.quote(f"model_reasoning_effort={effort}"),
                   "--sandbox", shlex.quote(sandbox or "workspace-write"),
-                  "-a", "on-request"]
+                  "-a", shlex.quote(approval or "on-request")]
     else:
         parts += [shlex.quote(program)] + [shlex.quote(a) for a in program_args]
     return " ".join(parts)
@@ -1396,25 +1397,119 @@ def spawn_window_argv(session, agent_id, cwd, line):
             "-n", agent_id, "-c", cwd, line)
 
 
+def allow_prefixes(values):
+    prefixes = []
+    for value in values:
+        prefix = value.strip()
+        if not prefix:
+            die("--allow command prefix cannot be empty")
+        if prefix not in prefixes:
+            prefixes.append(prefix)
+    return prefixes
+
+
+def write_claude_allowlist(cwd, prefixes):
+    path = os.path.join(cwd, ".claude", "settings.local.json")
+    try:
+        with open(path) as fh:
+            settings = json.load(fh)
+    except FileNotFoundError:
+        settings = {}
+    except (OSError, json.JSONDecodeError) as exc:
+        die(f"cannot read {path}: {exc}")
+    if not isinstance(settings, dict):
+        die(f"cannot update {path}: root must be a JSON object")
+    permissions = settings.setdefault("permissions", {})
+    if not isinstance(permissions, dict):
+        die(f"cannot update {path}: permissions must be a JSON object")
+    allowed = permissions.setdefault("allow", [])
+    if not isinstance(allowed, list):
+        die(f"cannot update {path}: permissions.allow must be a JSON array")
+    additions = [f"Bash({prefix}:*)" for prefix in prefixes]
+    additions = [entry for entry in additions if entry not in allowed]
+    if not additions:
+        return None
+    allowed.extend(additions)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump(settings, fh, indent=2)
+            fh.write("\n")
+    except OSError as exc:
+        die(f"cannot write {path}: {exc}")
+    return path
+
+
+def write_codex_allowlist(cwd, prefixes):
+    path = os.path.join(cwd, ".codex", "rules", "herdlet.rules")
+    rules = []
+    for prefix in prefixes:
+        try:
+            words = shlex.split(prefix)
+        except ValueError as exc:
+            die(f"invalid --allow command prefix {prefix!r}: {exc}")
+        if not words:
+            die("--allow command prefix cannot be empty")
+        rules.append(f"prefix_rule(pattern={json.dumps(words)}, decision=\"allow\")")
+    try:
+        with open(path) as fh:
+            body = fh.read()
+    except FileNotFoundError:
+        body = ""
+    except OSError as exc:
+        die(f"cannot read {path}: {exc}")
+    existing = set(body.splitlines())
+    additions = [rule for rule in rules if rule not in existing]
+    if not additions:
+        return None
+    updated = body
+    if updated and not updated.endswith("\n"):
+        updated += "\n"
+    updated += "\n".join(additions) + "\n"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(updated)
+    except OSError as exc:
+        die(f"cannot write {path}: {exc}")
+    return path
+
+
+def write_spawn_allowlist(agent, cwd, values):
+    prefixes = allow_prefixes(values)
+    if not prefixes:
+        return None
+    if agent == "claude":
+        return write_claude_allowlist(cwd, prefixes)
+    return write_codex_allowlist(cwd, prefixes)
+
+
 def cmd_spawn(args):
     if args.agent not in ("claude", "codex"):
         die("spawn supports claude and codex only; launch other agents by hand (see README)")
     sandbox = getattr(args, "sandbox", None)
+    approval = getattr(args, "approval", None)
     permission_mode = getattr(args, "permission_mode", None)
     if args.agent == "claude" and sandbox is not None:
         die("--sandbox is only valid with --agent codex")
+    if args.agent == "claude" and approval is not None:
+        die("--approval is only valid with --agent codex")
     if args.agent == "codex" and permission_mode is not None:
-        die("--permission-mode is claude-only; use --sandbox and the fixed -a on-request")
+        die("--permission-mode is claude-only; use --sandbox and --approval instead")
     caller = os.environ.get("TMUX_PANE")
     if not caller:
         die("spawn must run inside tmux")
     cwd = os.path.abspath(args.cwd or os.getcwd())
     brief = os.path.abspath(args.brief) if args.brief else None
     title = args.title or (brief_title(brief) if brief else None) or "worker"
+    allowlist = write_spawn_allowlist(args.agent, cwd,
+                                      getattr(args, "allow", None) or ())
+    if allowlist:
+        print(f"updated {allowlist}", file=sys.stderr)
     program = getattr(args, "program", None) or args.agent
     line = spawn_line(args.id, args.model, args.effort, title,
                       permission_mode or "auto", args.env or (), program,
-                      args.program_args or (), sandbox)
+                      args.program_args or (), sandbox, approval)
 
     fallback = None
     out = tmux_run(*spawn_split_argv(caller, cwd, line, args.vertical), timeout=15)
@@ -1593,6 +1688,16 @@ def cmd_approve(args):
         die("--option must be a single digit menu key")
     pane = resolve_pane(args.socket, args.id)
     tmux("send-keys", "-t", pane, args.option, check=True)  # bare keypress: menus react without Enter
+    report_failed = False
+    try:
+        record = call(args.socket, "agent.get", {"id": args.id}).get("result")
+        edge = record is not None
+        if edge:
+            call(args.socket, "agent.report",
+                 {"id": args.id, "state": "working",
+                  "message": f"approved option {args.option}"}, timeout=1.0)
+    except OSError:
+        edge, report_failed = False, True
     time.sleep(args.settle)
 
     if not args.wait:
@@ -1600,18 +1705,7 @@ def cmd_approve(args):
         print(out.rstrip("\n"))
         return 0
 
-    try:
-        record = call(args.socket, "agent.get", {"id": args.id}).get("result")
-        # only report working if the record still shows the stale pre-answer
-        # 'blocked'; a state that already moved on (settle-window race) must
-        # be seen by a plain (non-edge) wait below, not skipped past
-        edge = record is not None and record.get("state") == "blocked"
-        if edge:
-            # answering a menu resumes the turn either way (approve or deny);
-            # the next real hook event corrects this if the optimism is wrong
-            call(args.socket, "agent.report",
-                 {"id": args.id, "state": "working", "message": ""}, timeout=1.0)
-    except OSError:
+    if report_failed:
         # approve's core job (the keypress) already happened; don't fail after the side effect
         out = tmux("capture-pane", "-p", "-t", pane, "-S", f"-{args.lines}", check=True)
         print(out.rstrip("\n"))
@@ -1902,6 +1996,10 @@ def main():
     p.add_argument("--permission-mode", help="Claude permission mode (default: auto)")
     p.add_argument("--sandbox", choices=("read-only", "workspace-write", "danger-full-access"),
                    help="Codex sandbox mode (default: workspace-write)")
+    p.add_argument("--approval", choices=("on-request", "never"),
+                   help="Codex approval policy (default: on-request)")
+    p.add_argument("--allow", action="append", metavar="COMMAND_PREFIX",
+                   help="pre-allow a command prefix in the worker cwd (repeatable)")
     p.add_argument("--env", action="append", metavar="K=V",
                    help="extra env var for the worker (repeatable)")
     p.add_argument("--vertical", action="store_true", help="split vertically")
