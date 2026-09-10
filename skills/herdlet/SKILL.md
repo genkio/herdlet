@@ -538,7 +538,7 @@ ended its turn by asking you something. either way `peek` first, then:
   `--choice no` to deny. menus react to a bare keypress; `send` would append
   Enter. `--wait` is the primary form. one call answers and marks the worker
   `working`. then it waits for the next real transition and shows the pane.
-  the edge wait cannot match the stale pre-answer state:
+  the plain wait also returns a state that arrived during the settle period:
 
   ```bash
   herdlet approve --id herdlet/dev --wait                  # one-time Yes, then wait+peek

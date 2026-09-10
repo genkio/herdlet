@@ -156,8 +156,11 @@ class Bus:
 
     def report(self, agent_id, params):
         rec = self.agents.get(agent_id)
-        if (params.get("if_state") is not None
-                and (rec is None or rec["state"] != params["if_state"])):
+        state_changed = (params.get("if_state") is not None
+                         and (rec is None or rec["state"] != params["if_state"]))
+        record_changed = ("if_updated" in params
+                          and (rec is None or rec["updated"] != params["if_updated"]))
+        if state_changed or record_changed:
             return {"type": "agent.state_changed", "id": agent_id,
                     **(self.snapshot(agent_id) or {}),
                     "applied": False}
@@ -178,7 +181,7 @@ class Bus:
                 rec[key] = value
         if params.get("compact"):
             rec["compacts"] = int(rec.get("compacts") or 0) + 1
-        rec["updated"] = round(time.time(), 3)
+        rec["updated"] = max(time.time(), rec.get("updated", 0) + 0.000001)
         self._save()
         event_type = "compacted" if params.get("compact") else "agent.state_changed"
         event = {"type": event_type, **self.snapshot(agent_id)}
@@ -2113,13 +2116,17 @@ def cmd_approve(args):
             for line in pane_tail(capture):
                 print(line, file=sys.stderr)
             return EXIT_NO_MENU
-    tmux("send-keys", "-t", pane, option, check=True)  # bare keypress: menus react without Enter
     report_failed = False
     try:
         record = call(args.socket, "agent.get", {"id": args.id}).get("result")
+    except OSError:
+        record, report_failed = None, True
+    tmux("send-keys", "-t", pane, option, check=True)  # bare keypress: menus react without Enter
+    try:
         if record is not None:
             call(args.socket, "agent.report", {
                   "id": args.id, "state": "working", "if_state": "blocked",
+                  "if_updated": record.get("updated"),
                   "message": (f"approved {approved} (option {option})" if approved
                               else f"approved option {option}")}, timeout=1.0)
     except OSError:

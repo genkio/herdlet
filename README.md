@@ -81,7 +81,7 @@ herdlet peek --id builder --lines 40             # read builder's recent output 
 herdlet peek --id builder --transcript --lines 2 # read builder's own transcript instead of the pane
 herdlet approve --id builder                     # choose the first one-time Yes, then echo the pane
 herdlet approve --id builder --choice always     # choose the matching don't-ask-again option
-herdlet approve --id builder --choice no --wait  # deny, then edge-wait for the next transition
+herdlet approve --id builder --choice no --wait  # deny, then plain-wait for the next real state
 herdlet pair --id dev --with tester --topic plans/repro.md  # scoped peer channel between two workers
 herdlet ack --id builder                         # collected the result: done -> idle (list = inbox)
 herdlet ack --id builder --kill-pane             # also close a finished worker pane
@@ -109,6 +109,10 @@ back as `result.type: "timeout"` with exit 0. `approve --wait --timeout-ok`
 takes the flag too, where it only changes the exit code (0 instead of 2);
 `approve` prints a state line, not JSON. Neither form hides a hung daemon,
 which still fails.
+
+With `--wait`, approve changes the matching `blocked` record to `working`.
+Then a plain wait returns the next real state, including one that arrived during
+the settle period.
 
 `approve` selects `--choice yes` by default. `--choice always` selects a visible
 "do not ask again" or "always" option. If that option is absent, it selects

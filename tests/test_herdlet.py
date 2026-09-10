@@ -71,7 +71,8 @@ class HerdletTest(unittest.TestCase):
         self.assertIsNone(rec["message"])
 
     def test_report_if_state_is_compare_and_set(self):
-        self.parse(self.run_cli("report", "--id", "cas1", "--state", "blocked"))
+        first = self.parse(self.run_cli(
+            "report", "--id", "cas1", "--state", "blocked"))["result"]
         h = _load_module()
         rejected = h.call(self.sock, "agent.report", {
             "id": "cas1", "state": "working", "if_state": "idle"})
@@ -80,6 +81,17 @@ class HerdletTest(unittest.TestCase):
         applied = h.call(self.sock, "agent.report", {
             "id": "cas1", "state": "working", "if_state": "blocked"})
         self.assertEqual(applied["result"]["state"], "working")
+
+        self.run_cli("report", "--id", "cas1", "--state", "blocked")
+        newer = self.parse(self.run_cli(
+            "report", "--id", "cas1", "--state", "blocked",
+            "--message", "new permission"))["result"]
+        aba = h.call(self.sock, "agent.report", {
+            "id": "cas1", "state": "working", "if_state": "blocked",
+            "if_updated": first["updated"]})
+        self.assertFalse(aba["result"]["applied"])
+        self.assertEqual(aba["result"]["state"], "blocked")
+        self.assertEqual(aba["result"]["updated"], newer["updated"])
 
     def test_get_unknown_fails(self):
         proc = self.run_cli("get", "--id", "nope")
@@ -2423,6 +2435,23 @@ class ApproveTimeoutTest(_DaemonCase):
         self.assertEqual(code, 0)
         self.assertIn("state: done", out)
         self.assertEqual(self.record("ap/one")["state"], "done")
+
+    def test_new_blocked_report_after_capture_is_not_overwritten(self):
+        original = self.h.tmux
+
+        def tmux(*args, **kw):
+            if args[0] == "send-keys":
+                self.h.call(self.sock, "agent.report", {
+                    "id": "ap/one", "state": "blocked",
+                    "message": "second permission"})
+            return original(*args, **kw)
+
+        self.h.tmux = tmux
+        code, out, err = self.approve(wait=False)
+        record = self.record("ap/one")
+        self.assertEqual(code, 0)
+        self.assertEqual(record["state"], "blocked")
+        self.assertEqual(record["message"], "second permission")
 
     def test_no_menu_types_nothing_and_clears_stale_blocked(self):
         self.screen = CLAUDE_EMPTY_PANE
