@@ -249,14 +249,17 @@ to hold a conversation. read your peer's actual answer with
 
 ## spawn a worker agent
 
-for a Claude Code worker, use `herdlet spawn`. one command does the whole
+for a Claude Code or Codex worker, use `herdlet spawn`. one command does the whole
 launch: it builds the pane, pins the model and effort, mutes the human's
 per-turn notifications, keeps the pane readable, registers the worker BEFORE its
-first hook, waits for it to come up, and hands it its brief.
+first hook, waits for it to come up, and hands it its brief. Claude Code is the
+default agent. pass `--agent codex` for Codex.
 
 ```bash
 herdlet spawn --id proj/dev --model sonnet --effort medium --brief plans/dev.md
 # spawned proj/dev in %7 (sonnet/medium)
+herdlet spawn --agent codex --id proj/review --model gpt-5.6-sol --effort low --sandbox read-only --brief plans/review.md
+# spawned proj/review in %8 (gpt-5.6-sol/low)
 ```
 
 - `--id`, `--model` and `--effort` are required. never let a worker inherit the
@@ -265,16 +268,19 @@ herdlet spawn --id proj/dev --model sonnet --effort medium --brief plans/dev.md
 - `--brief PATH` is the normal way to task a worker: the title defaults to the
   brief's first heading, and once the worker is up it is sent
   `Read <brief> and do it.` write the brief to a file first.
-- `--title "<purpose>"` names the session when there is no brief, so the worker
-  is findable in the resume picker later.
-- other flags: `--cwd DIR`, `--vertical`, `--permission-mode <mode>`
-  (default `auto`), `--env K=V` (repeatable), `--ready-timeout SECONDS`
-  (default 30), `--json`.
+- `--title "<purpose>"` names a Claude Code session. for Codex, spawn stores the
+  title in the registry message but does not pass it to the launch command.
+- `--permission-mode <mode>` is for Claude Code only (default `auto`).
+  `--sandbox <mode>` is for Codex only (default `workspace-write`); Codex always
+  uses `-a on-request`.
+- other flags: `--cwd DIR`, `--vertical`, `--env K=V` (repeatable),
+  `--ready-timeout SECONDS` (default 30), `--json`.
 - exit 0 = the pane is up. either the worker registered and got its brief, or it
   had not reported within `--ready-timeout` but its pane is alive. in the second
   case **the brief was NOT sent** (the warning says so, and `--json` carries
-  `brief_sent`): `peek` the pane, clear whatever it is sitting on - a first run
-  in a new directory can be on a trust prompt - then `send` the brief yourself.
+  `brief_sent`): `peek` the pane, clear whatever it is sitting on, then `send`
+  the brief yourself. Codex spawn accepts its preselected trust option once and
+  continues to wait for the input prompt. pre-trusting the cwd avoids this prompt.
   exit 1 = the pane is already gone, so the launch command itself failed; check
   the model and effort you passed.
 - spawn also links you to the worker (one way, downward), so you can `send` to
@@ -285,7 +291,8 @@ herdlet spawn --id proj/dev --model sonnet --effort medium --brief plans/dev.md
 - if the window has no room to split, spawn opens a new window in your session
   instead and says so.
 
-`spawn` is claude-only. for any other agent, build the pane by hand as below.
+`spawn` supports Claude Code and Codex. for any other agent, build the pane by
+hand as below.
 
 spawn a non-claude worker with the **same launch command you were started
 under**, not a bare vendor binary. that command carries your model routing,
@@ -297,7 +304,7 @@ none of it and may hit the wrong endpoint or an unconfigured model. call it
 |---|---|
 | Claude Code | `claude` |
 | Claude Code via a custom endpoint (a wrapper you wrote that sets base url / key / model) | that wrapper |
-| Codex | `codex` |
+| Codex | use `herdlet spawn --agent codex`; no hand-built pane |
 | opencode | `opencode` (the `herdlet setup` plugin reports its state) |
 
 a bare `$LAUNCH -p` pane CLOSES the moment the agent exits, destroying its

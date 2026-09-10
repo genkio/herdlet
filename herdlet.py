@@ -61,8 +61,8 @@ BLOCKED_REEMIT = float(os.environ.get("HERDLET_BLOCKED_REEMIT", "30"))
 MAX_AGE = float(os.environ.get("HERDLET_MAX_AGE", str(3 * 86400)))
 PRUNE_INTERVAL = float(os.environ.get("HERDLET_PRUNE_INTERVAL", "3600"))
 # An agent parked on a usage-limit banner fires no hook, so the daemon scrapes
-# its pane and reports `limited` instead. Wording is Claude Code 2.1.263's own;
-# fast-mode limits are out because fast mode falls back to the normal one.
+# its pane and reports `limited` instead. This covers Claude Code 2.1.263 and
+# Codex 0.153 wording; fast-mode limits fall back to the normal one.
 LIMIT_PATTERN_DEFAULT = (
     r"usage limit reached"
     r"|you.?ve (hit|reached) your\b(?! fast\b)"
@@ -1265,9 +1265,28 @@ def cmd_send(args):
         record_peer_send(args.socket, from_id, args.id, topic, text)
 
 
+def codex_transcript_message(row):
+    payload = row.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    if (row.get("type") == "response_item" and payload.get("type") == "message"
+            and payload.get("role") == "assistant"):
+        text = "\n".join(
+            block.get("text") or "" for block in payload.get("content") or []
+            if isinstance(block, dict) and block.get("type") == "output_text"
+        ).strip()
+        return ("response_item", text) if text else None
+    if row.get("type") == "event_msg" and payload.get("type") == "task_complete":
+        text = payload.get("last_agent_message")
+        if isinstance(text, str) and text.strip():
+            return "task_complete", text.strip()
+    return None
+
+
 def transcript_messages(path, count):
     """Last `count` (timestamp, text) assistant messages of a jsonl, oldest first."""
     found = []
+    codex_sources = {}
     with open(path, errors="replace") as fh:
         for line in fh:
             line = line.strip()
@@ -1276,6 +1295,15 @@ def transcript_messages(path, count):
             try:
                 row = json.loads(line)
             except json.JSONDecodeError:
+                continue
+            codex = codex_transcript_message(row)
+            if codex:
+                source, text = codex
+                previous = codex_sources.get(text)
+                if previous and previous != source:
+                    continue
+                codex_sources[text] = source
+                found.append((row.get("timestamp"), text))
                 continue
             if row.get("type") != "assistant":
                 continue
@@ -1334,7 +1362,7 @@ def brief_title(path):
 
 
 def spawn_line(agent_id, model, effort, title, permission_mode,
-               env=(), program="claude", program_args=()):
+               env=(), program="claude", program_args=(), sandbox=None):
     parts = list(SPAWN_ENV) + [f"HERDLET_ID={shlex.quote(agent_id)}"]
     for pair in env:
         key, sep, value = pair.partition("=")
@@ -1347,6 +1375,12 @@ def spawn_line(agent_id, model, effort, title, permission_mode,
                   "--model", shlex.quote(model),
                   "--effort", shlex.quote(effort),
                   "--permission-mode", shlex.quote(permission_mode)]
+    elif program == "codex":
+        parts += ["codex",
+                  "-m", shlex.quote(model),
+                  "-c", shlex.quote(f"model_reasoning_effort={effort}"),
+                  "--sandbox", shlex.quote(sandbox or "workspace-write"),
+                  "-a", "on-request"]
     else:
         parts += [shlex.quote(program)] + [shlex.quote(a) for a in program_args]
     return " ".join(parts)
@@ -1363,16 +1397,24 @@ def spawn_window_argv(session, agent_id, cwd, line):
 
 
 def cmd_spawn(args):
-    if args.agent != "claude":
-        die("spawn supports claude only; launch other agents by hand (see README)")
+    if args.agent not in ("claude", "codex"):
+        die("spawn supports claude and codex only; launch other agents by hand (see README)")
+    sandbox = getattr(args, "sandbox", None)
+    permission_mode = getattr(args, "permission_mode", None)
+    if args.agent == "claude" and sandbox is not None:
+        die("--sandbox is only valid with --agent codex")
+    if args.agent == "codex" and permission_mode is not None:
+        die("--permission-mode is claude-only; use --sandbox and the fixed -a on-request")
     caller = os.environ.get("TMUX_PANE")
     if not caller:
         die("spawn must run inside tmux")
     cwd = os.path.abspath(args.cwd or os.getcwd())
     brief = os.path.abspath(args.brief) if args.brief else None
     title = args.title or (brief_title(brief) if brief else None) or "worker"
-    line = spawn_line(args.id, args.model, args.effort, title, args.permission_mode,
-                      args.env or (), args.program, args.program_args or ())
+    program = getattr(args, "program", None) or args.agent
+    line = spawn_line(args.id, args.model, args.effort, title,
+                      permission_mode or "auto", args.env or (), program,
+                      args.program_args or (), sandbox)
 
     fallback = None
     out = tmux_run(*spawn_split_argv(caller, cwd, line, args.vertical), timeout=15)
@@ -1392,20 +1434,23 @@ def cmd_spawn(args):
     # register before the worker's first hook: until then it has no record at
     # all, so a trust/onboarding prompt is only addressable by raw pane id
     ensure_daemon(args.socket)
-    params = {"id": args.id, "agent": "claude", "pane": pane, "cwd": cwd,
+    params = {"id": args.id, "agent": args.agent, "pane": pane, "cwd": cwd,
               "model": args.model, "effort": args.effort,
               "message": f"spawning: {title}"}
-    if not spawn_ready(args.socket, args.id, pane):
+    if args.agent == "codex" or not spawn_ready(args.socket, args.id, pane):
         params["state"] = "spawning"  # else a hook beat us here; don't undo it
     call_or_die(args.socket, "agent.report", params)
     pair_with_spawner(args.socket, args.id, brief, cwd)
 
-    if args.ready_timeout > 0:
-        call_or_die(args.socket, "wait", {
-            "id": args.id, "states": ["idle", "working"],
-            "timeout_ms": int(args.ready_timeout * 1000),
-        }, timeout=args.ready_timeout + 5)
-    ready = spawn_ready(args.socket, args.id, pane)
+    if args.agent == "codex":
+        ready = wait_for_codex_prompt(pane, args.ready_timeout)
+    else:
+        if args.ready_timeout > 0:
+            call_or_die(args.socket, "wait", {
+                "id": args.id, "states": ["idle", "working"],
+                "timeout_ms": int(args.ready_timeout * 1000),
+            }, timeout=args.ready_timeout + 5)
+        ready = spawn_ready(args.socket, args.id, pane)
     if ready and brief:
         send_text(pane, f"Read {brief} and do it.")
     # tmux answers a missing -t target with success and an empty line, so the
@@ -1429,7 +1474,9 @@ def cmd_spawn(args):
     if not ready:
         brief_note = ("; the brief was not sent, send it once the prompt is "
                       "cleared" if brief else "")
-        print(f"warning: {args.id} did not report in {args.ready_timeout}s; "
+        wait_note = ("did not show its input prompt" if args.agent == "codex"
+                     else "did not report")
+        print(f"warning: {args.id} {wait_note} in {args.ready_timeout}s; "
               f"pane {pane} is alive, peek/approve it by pane id{brief_note}",
               file=sys.stderr)
     return 0
@@ -1463,6 +1510,33 @@ def spawn_ready(sock_path, agent_id, pane):
     # acked worker, a record still inside MAX_AGE) from passing as this worker
     rec = call_or_die(sock_path, "agent.get", {"id": agent_id}).get("result") or {}
     return rec.get("state") in ("idle", "working") and rec.get("pane") == pane
+
+
+def codex_prompt_ready(text):
+    return bool(re.search(
+        r"^\s*(?:›\s*)?Ask Codex to do anything\s*$", text, re.I | re.M))
+
+
+def codex_trust_prompt(text):
+    return (bool(re.search(r"^\s*(?:›\s*)?1\.\s*Yes, continue\s*$", text,
+                           re.I | re.M))
+            and bool(re.search(r"^\s*2\.\s*No, quit\s*$", text, re.I | re.M)))
+
+
+def wait_for_codex_prompt(pane, timeout):
+    deadline = time.monotonic() + max(0, timeout)
+    trust_answered = False
+    while True:
+        text = tmux("capture-pane", "-p", "-t", pane) or ""
+        if codex_prompt_ready(text):
+            return True
+        if not trust_answered and codex_trust_prompt(text):
+            tmux("send-keys", "-t", pane, "Enter", check=True)
+            trust_answered = True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.1, remaining))
 
 
 def cmd_ack(args):
@@ -1816,23 +1890,25 @@ def main():
                         "pane: the last --lines assistant messages, verbatim")
     p.set_defaults(fn=cmd_peek)
 
-    p = sub.add_parser("spawn", help="launch a Claude Code worker in a new pane and register it")
+    p = sub.add_parser("spawn", help="launch a Claude Code or Codex worker in a new pane and register it")
     p.add_argument("--id", required=True, help="agent id, e.g. myproject/dev")
     p.add_argument("--model", required=True, help="model id (never inherit the default)")
     p.add_argument("--effort", required=True,
                    choices=("low", "medium", "high", "xhigh"))
-    p.add_argument("--agent", default="claude", help="agent kind (only claude for now)")
+    p.add_argument("--agent", default="claude", help="agent kind: claude or codex (default: claude)")
     p.add_argument("--title", help="one-line purpose (default: the brief's first heading)")
     p.add_argument("--brief", help="brief file; the worker is told to read it and do it")
     p.add_argument("--cwd", help="worker's working directory (default: yours)")
-    p.add_argument("--permission-mode", default="auto")
+    p.add_argument("--permission-mode", help="Claude permission mode (default: auto)")
+    p.add_argument("--sandbox", choices=("read-only", "workspace-write", "danger-full-access"),
+                   help="Codex sandbox mode (default: workspace-write)")
     p.add_argument("--env", action="append", metavar="K=V",
                    help="extra env var for the worker (repeatable)")
     p.add_argument("--vertical", action="store_true", help="split vertically")
     p.add_argument("--ready-timeout", type=float, default=30,
-                   help="seconds to wait for the worker's first hook (default: 30)")
+                   help="seconds to wait for worker readiness (default: 30)")
     p.add_argument("--json", action="store_true")
-    p.add_argument("--program", default="claude", help=argparse.SUPPRESS)
+    p.add_argument("--program", help=argparse.SUPPRESS)
     p.add_argument("--program-args", action="append", help=argparse.SUPPRESS)
     p.set_defaults(fn=cmd_spawn)
 

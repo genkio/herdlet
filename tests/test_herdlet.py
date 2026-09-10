@@ -623,9 +623,22 @@ class HerdletTest(unittest.TestCase):
 
     def test_spawn_rejects_other_agents(self):
         proc = self.run_cli("spawn", "--id", "x/y", "--model", "opus",
-                            "--effort", "high", "--agent", "codex")
+                            "--effort", "high", "--agent", "opencode")
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("spawn supports claude only", proc.stderr)
+        self.assertIn("spawn supports claude and codex only", proc.stderr)
+
+    def test_spawn_rejects_sandbox_for_claude(self):
+        proc = self.run_cli("spawn", "--id", "x/y", "--model", "opus",
+                            "--effort", "high", "--sandbox", "read-only")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("--sandbox is only valid with --agent codex", proc.stderr)
+
+    def test_spawn_rejects_permission_mode_for_codex(self):
+        proc = self.run_cli("spawn", "--id", "x/y", "--model", "gpt-5.6-sol",
+                            "--effort", "low", "--agent", "codex",
+                            "--permission-mode", "auto")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("use --sandbox and the fixed -a on-request", proc.stderr)
 
     def test_spawn_outside_tmux_dies(self):
         proc = self.run_cli("spawn", "--id", "x/y", "--model", "opus",
@@ -1077,6 +1090,13 @@ class LimitSweepTest(unittest.TestCase):
             self.sweep(lambda pane, b=banner: b)
             self.assertEqual(self.bus.agents["w"]["state"], "limited", banner)
 
+    def test_codex_hard_limit_matches(self):
+        self.assertTrue(self.h.limit_regex().search("You've hit your usage limit"))
+
+    def test_codex_reset_info_does_not_match(self):
+        text = "You have 2 usage limit resets available. Run /usage to use one."
+        self.assertIsNone(self.h.limit_regex().search(text))
+
     def test_fast_mode_limits_are_not_a_stop(self):
         # fast mode falls back to the normal one, so the agent keeps working
         for banner in ("You've hit your fast limit · resets in 2h",
@@ -1304,6 +1324,32 @@ class SpawnLineTest(unittest.TestCase):
         self.assertIn("proj/dev: don't; rm -rf /", words)
         self.assertIn("API_KEY=a b'c", words)
 
+    def test_codex_launch_line(self):
+        line = self.h.spawn_line("proj/dev", "gpt-5.6-sol", "low", "probe",
+                                 "auto", program="codex", sandbox="read-only")
+        self.assertEqual(line, (
+            "CC_IMESSAGE_SKIP=1 CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 "
+            "HERDLET_ID=proj/dev codex -m gpt-5.6-sol "
+            "-c model_reasoning_effort=low --sandbox read-only -a on-request"))
+        self.assertNotIn("probe", line)
+
+    def test_codex_launch_line_defaults_to_workspace_write(self):
+        line = self.h.spawn_line("proj/dev", "gpt-5.6-sol", "low", "probe",
+                                 "auto", program="codex")
+        self.assertIn("--sandbox workspace-write", line)
+
+    def test_codex_prompt_matcher(self):
+        self.assertTrue(self.h.codex_prompt_ready("Ask Codex to do anything\n"))
+        self.assertTrue(self.h.codex_prompt_ready("  › Ask Codex to do anything  \n"))
+        self.assertTrue(self.h.codex_prompt_ready("ASK CODEX TO DO ANYTHING\n"))
+        self.assertFalse(self.h.codex_prompt_ready("› 1. Yes, continue\n2. No, quit"))
+
+    def test_codex_trust_prompt_matcher(self):
+        menu = ("Do you trust the contents of this directory?\n\n"
+                "› 1. Yes, continue\n  2. No, quit\n")
+        self.assertTrue(self.h.codex_trust_prompt(menu))
+        self.assertFalse(self.h.codex_trust_prompt("› Ask Codex to do anything\n"))
+
     def test_extra_env_comes_before_the_program(self):
         line = self.h.spawn_line("p/d", "sonnet", "low", "t", "auto",
                                  env=["FOO=bar", "BAZ=qux"])
@@ -1418,7 +1464,7 @@ class SpawnCommandTest(_DaemonCase):
                     agent="claude", title=None, brief=None, cwd=None,
                     permission_mode="auto", env=None, vertical=False,
                     ready_timeout=0.5, json=False, program="claude",
-                    program_args=None)
+                    program_args=None, sandbox=None)
         base.update(kw)
         return _Args(**base)
 
@@ -1443,6 +1489,25 @@ class SpawnCommandTest(_DaemonCase):
         self.assertEqual(rec["message"], "spawning: worker")
         self.assertEqual(out.strip(), "spawned proj/dev in %7 (opus/high)")
         self.assertEqual(code, 0)   # not ready is not a failure
+
+    def test_codex_registers_and_uses_the_input_prompt_for_readiness(self):
+        original = self.h.tmux
+
+        def tmux(*args, **kw):
+            if args[0] == "capture-pane":
+                return "› Ask Codex to do anything\n"
+            return original(*args, **kw)
+
+        self.h.tmux = tmux
+        code, out, err = self.spawn(agent="codex", model="gpt-5.6-sol",
+                                    effort="low", permission_mode=None,
+                                    program=None, sandbox="read-only")
+        rec = self.record("proj/dev")
+        self.assertEqual(rec["state"], "spawning")
+        self.assertEqual(rec["agent"], "codex")
+        self.assertEqual((rec["model"], rec["effort"]), ("gpt-5.6-sol", "low"))
+        self.assertEqual(err, "")
+        self.assertEqual(code, 0)
 
     def test_ready_worker_gets_its_brief_with_an_absolute_path(self):
         brief = os.path.join(self.tmp.name, "b.md")
@@ -1711,14 +1776,36 @@ class TranscriptParseTest(unittest.TestCase):
             ("t2", [{"type": "text", "text": "two"}])))
         self.assertEqual(self.h.transcript_messages(path, 1), [("t2", "two")])
 
-    def test_string_content_and_junk_lines_survive(self):
+    def test_codex_messages_are_oldest_first_and_deduplicated(self):
+        path = self.write("\n".join((
+            json.dumps({"timestamp": "t1", "type": "response_item", "payload": {
+                "type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "one"},
+                    {"type": "reasoning", "summary": "hidden"},
+                    {"type": "output_text", "text": "two"}]}}),
+            json.dumps({"timestamp": "t2", "type": "event_msg", "payload": {
+                "type": "task_complete", "last_agent_message": "one\ntwo"}}),
+            json.dumps({"timestamp": "t3", "type": "response_item", "payload": {
+                "type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "three"}]}}),
+            json.dumps({"timestamp": "t4", "type": "event_msg", "payload": {
+                "type": "task_complete", "last_agent_message": "four"}}),
+        )) + "\n")
+        self.assertEqual(self.h.transcript_messages(path, 5),
+                         [("t1", "one\ntwo"), ("t3", "three"), ("t4", "four")])
+
+    def test_mixed_formats_and_garbage_lines_survive(self):
         path = self.write(
             json.dumps({"type": "assistant",
                         "message": {"role": "assistant", "content": "plain"}}) + "\n"
             + "not json\n\n"
+            + json.dumps({"timestamp": "t2", "type": "response_item", "payload": {
+                "type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "codex"}]}}) + "\n"
             + json.dumps({"type": "user", "message": {"role": "user",
                                                       "content": "hi"}}) + "\n")
-        self.assertEqual(self.h.transcript_messages(path, 5), [(None, "plain")])
+        self.assertEqual(self.h.transcript_messages(path, 5),
+                         [(None, "plain"), ("t2", "codex")])
 
 
 if __name__ == "__main__":

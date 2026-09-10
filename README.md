@@ -73,6 +73,7 @@ herdlet list --prefix myproject/                 # scope to one project's agents
 herdlet wait --id builder --match 'tests? passed|ERROR' --timeout 600  # wait on pane OUTPUT (plain commands too)
 
 herdlet spawn --id myproject/dev --model sonnet --effort medium --brief plans/dev.md  # new pane, registered from t=0
+herdlet spawn --agent codex --id myproject/review --model gpt-5.6-sol --effort low --sandbox read-only
 herdlet send --id builder "run the tests again"  # types into builder's pane + Enter
 herdlet send --id builder --file plans/next.md   # long or multi-line message from a file ('-' = stdin)
 herdlet peek --id builder --lines 40             # read builder's recent output (--join unwraps soft wraps)
@@ -239,17 +240,19 @@ a tester, requirement is ...", and it runs
 ```bash
 herdlet spawn --id personal/herdlet/dev    --model sonnet --effort medium --brief plans/dev.md
 herdlet spawn --id personal/herdlet/tester --model haiku  --effort low    --brief plans/tester.md
+herdlet spawn --agent codex --id personal/herdlet/review --model gpt-5.6-sol --effort low --sandbox read-only
 ```
 
-`spawn` splits the caller's own pane, builds the launch line (mute env vars,
-classic renderer, `HERDLET_ID`, a session name, the model and effort you asked
-for), registers the worker as `spawning` before its first hook fires, links
-itself to it one way (see "Peer channel"), waits for that hook, then hands it
-its brief. `--model` and `--effort` are required on purpose: a worker is a
+`spawn` launches Claude Code by default. Pass `--agent codex` for Codex and
+choose its `--sandbox` (`workspace-write` by default). It splits the caller's
+own pane, builds the launch line, registers the worker as `spawning`, and links
+itself to the worker one way (see "Peer channel"). It waits for a Claude hook
+or the Codex input prompt, then hands the worker its brief. `--model` and
+`--effort` are required on purpose: a worker is a
 top-level session, so anything you do not pin explicitly runs on your MAIN
-(priciest) model, and that is the whole cost lever. Other
-agents (codex, opencode, a wrapper that sets a custom endpoint) still launch by
-hand with `tmux split-window`; see the skill for that recipe.
+(priciest) model, and that is the whole cost lever. Other agents (opencode or a
+wrapper that sets a custom endpoint) still launch by hand with
+`tmux split-window`; see the skill for that recipe.
 
 then drives the pair with `send` / `wait --state done,blocked,limited` / `peek`,
 relaying between roles and reporting back to you. Hours later, "now genkia"
@@ -274,6 +277,7 @@ npx skills add genkio/herdlet        # Claude Code, Codex, Cursor, ...
 ```bash
 # spawn a worker in a new pane, wait for it, read its result
 herdlet spawn --id proj/worker --model haiku --effort low --brief plans/worker.md
+herdlet spawn --agent codex --id proj/reviewer --model gpt-5.6-sol --effort low --sandbox read-only --brief plans/review.md
 herdlet wait --id proj/worker --state done,blocked,limited --timeout 900
 herdlet peek --id proj/worker --transcript --lines 2
 herdlet send --id proj/worker "now fix the failing test"
@@ -281,8 +285,8 @@ herdlet send --id proj/worker "now fix the failing test"
 
 The waiter is woken by a push from the daemon, not a polling loop.
 
-For a non-Claude agent, or a one-shot `-p` wrapper, build the pane yourself and
-let the worker's hooks register it:
+For an agent other than Claude Code or Codex, or a one-shot `-p` wrapper, build
+the pane yourself and let the worker's hooks register it:
 
 ```bash
 tmux split-window -d -P -F '#{pane_id}' -t "$TMUX_PANE" "HERDLET_ID=proj/worker $LAUNCH -n 'proj/worker: test suite' --model <cheap-id> -p 'run the test suite'"
