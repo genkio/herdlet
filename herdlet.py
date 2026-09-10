@@ -28,6 +28,12 @@ import time
 
 __version__ = "0.9.0"
 
+EXIT_TIMEOUT = 2
+EXIT_SCOPE = 3
+EXIT_SEND = 4
+EXIT_NO_MENU = 5
+EXIT_NO_INPUT = 6
+
 
 def _log(*parts):
     print(time.strftime("%H:%M:%S"), *parts, flush=True)
@@ -149,12 +155,19 @@ class Bus:
         return {"id": agent_id, "compacts": 0, "peers": [], "topics": {}, **rec}
 
     def report(self, agent_id, params):
-        rec = self.agents.setdefault(agent_id, {
-            "state": "unknown", "message": None, "agent": None,
-            "pane": None, "cwd": None, "session": None, "transcript": None,
-            "model": None, "effort": None, "compacts": 0,
-            "peers": [], "topics": {}, "updated": 0.0,
-        })
+        rec = self.agents.get(agent_id)
+        if (params.get("if_state") is not None
+                and (rec is None or rec["state"] != params["if_state"])):
+            return {"type": "agent.state_changed", "id": agent_id,
+                    **(self.snapshot(agent_id) or {}),
+                    "applied": False}
+        if rec is None:
+            rec = self.agents.setdefault(agent_id, {
+                "state": "unknown", "message": None, "agent": None,
+                "pane": None, "cwd": None, "session": None, "transcript": None,
+                "model": None, "effort": None, "compacts": 0,
+                "peers": [], "topics": {}, "updated": 0.0,
+            })
         state = params.get("state") or rec["state"]
         rec["state"] = state
         for key in MERGE_KEYS:
@@ -311,7 +324,26 @@ class Bus:
             self._fanout({"type": "agent.removed", "id": aid}, aid, None)
         if drop:
             self._save()
+        self._prune_send_locks(now)
         self.start_prune_sweeps()
+
+    def _prune_send_locks(self, now):
+        if not self.state_path or MAX_AGE <= 0:
+            return
+        try:
+            entries = os.scandir(self.state_path + ".d")
+        except OSError:
+            return
+        with entries:
+            for entry in entries:
+                try:
+                    if (entry.name.startswith("send-")
+                            and entry.name.endswith(".lock")
+                            and entry.is_file(follow_symlinks=False)
+                            and now - entry.stat(follow_symlinks=False).st_mtime > MAX_AGE):
+                        os.unlink(entry.path)
+                except OSError:
+                    continue
 
     def start_limit_sweeps(self, capture=None):
         if not LIMIT_SWEEP or LIMIT_INTERVAL <= 0:
@@ -640,7 +672,7 @@ def die(msg):
 def emit(resp):
     print(json.dumps(resp, indent=2))
     if resp and "error" in resp:
-        sys.exit(2 if resp["error"].get("code") == "timeout" else 1)
+        sys.exit(EXIT_TIMEOUT if resp["error"].get("code") == "timeout" else 1)
 
 
 def default_id():
@@ -734,11 +766,19 @@ def cmd_get(args):
     emit(call_or_die(args.socket, "agent.get", {"id": args.id or default_id()}))
 
 
-def pane_kill_allowed(rec, command):
-    return rec.get("state") in ("done", "ended") or command in SHELLS
+def record_is_stale(rec, command, now=None):
+    now = time.time() if now is None else now
+    return (rec.get("state") in ("working", "blocked", "spawning", "limited")
+            and command in SHELLS
+            and now - rec.get("updated", 0) > STALE_AFTER)
 
 
-def kill_record_pane(agent_id, rec):
+def pane_kill_allowed(rec, command, force=False, now=None):
+    return (force or rec.get("state") in ("done", "ended")
+            or record_is_stale(rec, command, now))
+
+
+def kill_record_pane(agent_id, rec, force=False):
     pane = rec.get("pane")
     if not pane:
         print(f"{agent_id}: no pane to kill", file=sys.stderr)
@@ -749,11 +789,14 @@ def kill_record_pane(agent_id, rec):
         print(f"{agent_id}: pane {pane} is gone", file=sys.stderr)
         return False
     current = (status.split("\t", 1) + [""])[:2][1]
-    if not pane_kill_allowed(rec, current):
+    if not pane_kill_allowed(rec, current, force):
         print(f"{agent_id}: pane {pane} still runs {current}; not killed",
               file=sys.stderr)
         return False
-    tmux("kill-pane", "-t", pane, check=True)
+    if tmux("kill-pane", "-t", pane) is None:
+        print(f"{agent_id}: pane {pane} vanished before it could be killed",
+              file=sys.stderr)
+        return False
     print(f"{agent_id}: killed pane {pane}")
     return True
 
@@ -764,7 +807,7 @@ def cmd_remove(args):
         die("no agent id: pass --id, or set HERDLET_ID, or run inside tmux")
     rec = call_or_die(args.socket, "agent.get", {"id": agent_id}).get("result")
     if args.kill_pane and rec:
-        kill_record_pane(agent_id, rec)
+        kill_record_pane(agent_id, rec, args.force)
     emit(call_or_die(args.socket, "agent.remove", {"id": agent_id}))
 
 
@@ -825,9 +868,7 @@ def annotate(agents, panes):
         # freshness check is what keeps a just-spawned or actively-hooking worker
         # (whose pane_current_command is a shell) from being called stale while
         # it is plainly alive - the friction that made one-shot workers unusable.
-        if (info and rec["state"] in ("working", "blocked", "spawning", "limited")
-                and info.get("command") in SHELLS
-                and now - rec["updated"] > STALE_AFTER):
+        if info and record_is_stale(rec, info.get("command"), now):
             rec["state"] = "stale"
         rec["where"] = f"{info['session']}:{info['window_index']} {info['window_name']}" if info else ""
         rec["age"] = age(now - rec["updated"])
@@ -928,7 +969,7 @@ def wait_for_match(args, ids):
                 print(json.dumps(timeout_as_result(resp), indent=2))
                 return 0
             print(json.dumps(resp, indent=2))
-            return 2
+            return EXIT_TIMEOUT
         time.sleep(2)
 
 
@@ -1005,7 +1046,8 @@ CODEX_HOOK_CMD = ("command -v herdlet >/dev/null 2>&1 && "
 NOTIFY_MATCHER = "permission_prompt|elicitation_dialog"
 CLAUDE_EVENTS = ("SessionStart", "SessionEnd", "UserPromptSubmit",
                  "PostToolUse", "Notification", "PreCompact", "Stop")
-CODEX_EVENTS = ("UserPromptSubmit", "PreToolUse", "PermissionRequest", "Stop")
+CODEX_EVENTS = ("UserPromptSubmit", "PreToolUse", "PermissionRequest",
+                "PreCompact", "Stop")
 
 
 def _load_json(path):
@@ -1263,15 +1305,20 @@ def send_text(pane, text, no_enter=False):
         tmux("send-keys", "-t", pane, "Enter", check=True)
 
 
-def verified_send(pane, text, settle):
+def verified_send(pane, text, settle, before_send=None):
     pending = wait_for_empty_input(pane, settle)
-    quiesced = not bool(pending)
+    if pending is None:
+        return "no-input"
+    if pending:
+        return "draft"
+    if before_send:
+        before_send()
     send_text(pane, text)
     pending = wait_for_empty_input(pane, settle)
     if pending:
         tmux("send-keys", "-t", pane, "Enter", check=True)
         pending = wait_for_empty_input(pane, settle)
-    return quiesced, not bool(pending)
+    return "sent" if not pending else "stuck"
 
 
 THREAD_HEADING = "## Thread"
@@ -1324,7 +1371,7 @@ def peer_scope(sock_path, target):
     if target not in (rec.get("peers") or []):
         print(f"herdlet: not paired with {target}; "
               f"raise it in your report to the master", file=sys.stderr)
-        sys.exit(3)
+        sys.exit(EXIT_SCOPE)
     return caller, (rec.get("topics") or {}).get(target)
 
 
@@ -1382,8 +1429,8 @@ def cmd_send(args):
     if not text:
         die(f"nothing to send: {args.file} is empty" if args.file
             else "nothing to send: the message is empty")
-    if args.no_enter and not args.no_verify:
-        die("--no-enter requires --no-verify")
+    if args.no_enter:
+        args.no_verify = True
     if args.ack and args.no_verify:
         die("--ack requires verification")
     if args.settle < 0:
@@ -1400,14 +1447,27 @@ def cmd_send(args):
             send_text(pane, text, args.no_enter)
             verified = False
         else:
-            quiesced, verified = verified_send(pane, text, args.settle)
-            if not quiesced:
-                print(f"herdlet: input in {args.id} did not clear within "
-                      f"{args.settle:g}s; sending anyway", file=sys.stderr)
-            if not verified:
+            def baseline():
+                nonlocal record
+                if args.ack:
+                    record = send_record(args.socket, args.id)
+
+            result = verified_send(pane, text, args.settle, baseline)
+            verified = result == "sent"
+            if result == "no-input":
+                print(f"herdlet: no input box on {args.id}; nothing typed",
+                      file=sys.stderr)
+                for line in pane_tail(capture_pane(pane)):
+                    print(line, file=sys.stderr)
+                return EXIT_NO_INPUT
+            if result == "draft":
+                print(f"herdlet: {args.id} still holds unsubmitted text; "
+                      "nothing typed", file=sys.stderr)
+                return EXIT_SEND
+            if result == "stuck":
                 print(f"herdlet: send to {args.id} not submitted; "
                       "text is sitting in its prompt", file=sys.stderr)
-                return 4
+                return EXIT_SEND
         if args.ack:
             if record is None:
                 print(f"herdlet: send to {args.id} has no hook record; "
@@ -1419,7 +1479,7 @@ def cmd_send(args):
                 if not acknowledged:
                     print(f"herdlet: send to {args.id} was submitted, but no "
                           "hook acknowledgment arrived", file=sys.stderr)
-                    return 4
+                    return EXIT_SEND
         if from_id:
             record_peer_send(args.socket, from_id, args.id, topic, text)
     finally:
@@ -1750,7 +1810,7 @@ def cmd_spawn(args):
                       args.program_args or (), sandbox, approval)
 
     fallback = None
-    placement = "right-stack"
+    placement = "vertical" if args.vertical else "right-stack"
     pane_output = tmux("list-panes", "-t", caller, "-F", SPAWN_PANE_FORMAT,
                        check=True) or ""
     target = spawn_target(caller, spawn_panes(pane_output), args.min_height,
@@ -1873,7 +1933,7 @@ def wait_for_codex_prompt(pane, timeout):
     deadline = time.monotonic() + max(0, timeout)
     trust_answered = False
     while True:
-        text = tmux("capture-pane", "-p", "-t", pane) or ""
+        text = capture_pane(pane)
         if codex_prompt_ready(text):
             return True
         if not trust_answered and codex_trust_prompt(text):
@@ -1885,11 +1945,14 @@ def wait_for_codex_prompt(pane, timeout):
         time.sleep(min(0.1, remaining))
 
 
+MENU_CONTROL_PATTERN = r"(?:esc to cancel|enter to confirm|\(esc\))"
+
+
 def pane_has_menu(capture):
     if codex_trust_prompt(capture):
         return True
     choices = re.findall(r"^\s*[❯›>]?\s*\d+\.\s+\S", capture, re.M)
-    controls = re.search(r"(?:esc to cancel|enter to confirm|\(esc\))", capture, re.I)
+    controls = re.search(MENU_CONTROL_PATTERN, capture, re.I)
     return len(choices) >= 2 and bool(controls)
 
 
@@ -1905,7 +1968,7 @@ def menu_options(capture):
             continue
         if current:
             text = line.strip()
-            if re.search(r"(?:esc to cancel|enter to confirm)", text, re.I):
+            if re.search(MENU_CONTROL_PATTERN, text, re.I):
                 options.append((current[0], " ".join(current[1])))
                 current = None
             elif text and not re.fullmatch(r"[─━]+", text):
@@ -1951,6 +2014,11 @@ def pane_tail(capture, lines=5):
     return [line.strip() for line in capture.splitlines() if line.strip()][-lines:]
 
 
+def show_tail(pane, lines):
+    out = tmux("capture-pane", "-p", "-t", pane, "-S", f"-{lines}", check=True)
+    print((out or "").rstrip("\n"))
+
+
 def cmd_ack(args):
     ids = [s.strip() for s in args.id.split(",") if s.strip()]
     missing = 0
@@ -1965,17 +2033,17 @@ def cmd_ack(args):
             call_or_die(args.socket, "agent.report", {"id": agent_id, "state": "idle"})
             print(f"{agent_id}: done -> idle")
             if args.kill_pane:
-                kill_record_pane(agent_id, rec)
+                kill_record_pane(agent_id, rec, args.force)
         elif rec["state"] == "ended":
             # dead + collected: clear it so `list` stays an inbox of live work
             if args.kill_pane:
-                kill_record_pane(agent_id, rec)
+                kill_record_pane(agent_id, rec, args.force)
             call_or_die(args.socket, "agent.remove", {"id": agent_id})
             print(f"{agent_id}: ended -> removed")
         else:
             print(f"{agent_id}: {rec['state']} (nothing to ack)")
             if args.kill_pane:
-                kill_record_pane(agent_id, rec)
+                kill_record_pane(agent_id, rec, args.force)
     return 1 if missing else 0
 
 
@@ -2023,7 +2091,7 @@ def cmd_approve(args):
         print(f"herdlet: no menu on {args.id}; nothing typed", file=sys.stderr)
         for line in pane_tail(capture):
             print(line, file=sys.stderr)
-        return 5
+        return EXIT_NO_MENU
     option = args.option
     approved = None
     if option is None:
@@ -2036,36 +2104,31 @@ def cmd_approve(args):
                   file=sys.stderr)
             for line in pane_tail(capture):
                 print(line, file=sys.stderr)
-            return 5
+            return EXIT_NO_MENU
     tmux("send-keys", "-t", pane, option, check=True)  # bare keypress: menus react without Enter
     report_failed = False
     try:
         record = call(args.socket, "agent.get", {"id": args.id}).get("result")
-        edge = record is not None
-        if edge:
-            call(args.socket, "agent.report",
-                 {"id": args.id, "state": "working",
+        if record is not None:
+            call(args.socket, "agent.report", {
+                  "id": args.id, "state": "working", "if_state": "blocked",
                   "message": (f"approved {approved} (option {option})" if approved
                               else f"approved option {option}")}, timeout=1.0)
     except OSError:
-        edge, report_failed = False, True
+        report_failed = True
     time.sleep(args.settle)
 
     if not args.wait:
-        out = tmux("capture-pane", "-p", "-t", pane, "-S", f"-{args.lines}", check=True)
-        print(out.rstrip("\n"))
+        show_tail(pane, args.lines)
         return 0
 
     if report_failed:
         # approve's core job (the keypress) already happened; don't fail after the side effect
-        out = tmux("capture-pane", "-p", "-t", pane, "-S", f"-{args.lines}", check=True)
-        print(out.rstrip("\n"))
+        show_tail(pane, args.lines)
         return 0
 
     states = [s.strip() for s in args.state.split(",") if s.strip()]
     params = {"id": args.id, "states": states}
-    if edge:
-        params["edge"] = True
     if args.timeout:
         params["timeout_ms"] = int(args.timeout * 1000)
     client_timeout = args.timeout + 5 if args.timeout else None
@@ -2076,16 +2139,14 @@ def cmd_approve(args):
     except TimeoutError:  # hung daemon: still a failure, whatever --timeout-ok says
         state, hung = "timeout", True
     except OSError:
-        out = tmux("capture-pane", "-p", "-t", pane, "-S", f"-{args.lines}", check=True)
-        print(out.rstrip("\n"))
+        show_tail(pane, args.lines)
         return 0
 
-    out = tmux("capture-pane", "-p", "-t", pane, "-S", f"-{args.lines}", check=True)
     print(f"state: {state}")
-    print(out.rstrip("\n"))
+    show_tail(pane, args.lines)
     if state != "timeout":
         return 0
-    return 0 if args.timeout_ok and not hung else 2
+    return 0 if args.timeout_ok and not hung else EXIT_TIMEOUT
 
 
 COLORS = {"working": "\033[33m", "blocked": "\033[1;31m", "done": "\033[32m",
@@ -2288,7 +2349,9 @@ def main():
     p = sub.add_parser("remove", help="remove an agent from the registry")
     p.add_argument("--id", help="agent id (default: $HERDLET_ID or $TMUX_PANE)")
     p.add_argument("--kill-pane", action="store_true",
-                   help="also kill a finished agent pane or a pane at a shell")
+                   help="also kill a finished agent pane or a stale shell pane")
+    p.add_argument("--force", action="store_true",
+                   help="with --kill-pane, also kill a live nonterminal pane")
     p.set_defaults(fn=cmd_remove)
 
     p = sub.add_parser("wait", help="block until an agent reaches a state, or its pane output matches")
@@ -2328,7 +2391,7 @@ def main():
     p.add_argument("--ack", action="store_true",
                    help="wait for the target hook to record the submitted prompt")
     p.add_argument("--no-verify", action="store_true",
-                   help="send without prompt checks (required with --no-enter)")
+                   help="send without prompt checks (--no-enter implies this)")
     p.add_argument("--json", action="store_true")
     p.add_argument("--file", help="read the message from PATH ('-' for stdin) "
                                   "instead of the positional text")
@@ -2377,7 +2440,9 @@ def main():
     p = sub.add_parser("ack", help="mark collected results as seen: done -> idle")
     p.add_argument("--id", required=True, help="agent id(s), comma-separated")
     p.add_argument("--kill-pane", action="store_true",
-                   help="also kill a finished agent pane or a pane at a shell")
+                   help="also kill a finished agent pane or a stale shell pane")
+    p.add_argument("--force", action="store_true",
+                   help="with --kill-pane, also kill a live nonterminal pane")
     p.set_defaults(fn=cmd_ack)
 
     p = sub.add_parser("resume", help="type an agent's native resume command into its pane")

@@ -90,6 +90,18 @@ herdlet resume --id builder                      # agent died? type its native r
 herdlet monitor                                  # live TUI (made for a tmux popup)
 ```
 
+### Exit codes
+
+| Code | Meaning |
+|---:|---|
+| 0 | Success |
+| 1 | General command or daemon error |
+| 2 | Wait timeout |
+| 3 | Peer-scope refusal |
+| 4 | Send refusal or submission error |
+| 5 | Approve menu or choice not found |
+| 6 | Send input box not found |
+
 `wait` exits 2 on timeout, which is what the chunked-wait loop below keys on.
 Harnesses that surface a background command's exit code as a failure (Claude
 Code's background Bash among them) should pass `--timeout-ok`: the timeout comes
@@ -113,15 +125,15 @@ non-empty lines on stderr. It also changes a stale `blocked` record to `working`
 because another user already answered the menu.
 
 `ack --kill-pane` and `remove --kill-pane` close panes for finished records or
-panes at a shell. They do not close a live agent with a nonterminal state. In
-that case, the command writes a note and leaves the pane open.
+stale shell panes. They do not close a fresh worker behind a shell wrapper.
+Pass `--force` to override this guard.
 
 Agent ids resolve from `--id`, then `$HERDLET_ID`, then `$TMUX_PANE`. Name an
 agent by launching it with an env var: `HERDLET_ID=builder claude`.
 
 `send` serializes messages for each target pane. It waits up to five seconds for
-existing input to clear before it types. If the input stays, it sends the message
-and writes a warning to stderr.
+existing input to clear before it types. If the input stays, it exits 4 and types
+nothing. If no input box is visible, it exits 6 and shows the pane tail.
 
 After Enter, `send` makes sure that the input box is empty. It sends Enter one
 more time if the text remains. If the second attempt fails, `send` exits 4 and
@@ -131,8 +143,8 @@ Pass `--ack` to wait for the target hook to record the prompt and the `working`
 state. An unregistered pane has no hooks, so `send` skips this wait and writes a
 note. Pass `--json` to print the send result.
 
-Pass `--no-verify` for the old fire-and-forget behavior. The `--no-enter` flag
-requires `--no-verify` and types without submission.
+Pass `--no-verify` to bypass both input checks and use fire-and-forget behavior.
+The `--no-enter` flag implies `--no-verify` and types without submission.
 
 Short text uses `tmux send-keys`. Text that is multi-line or more than 200
 characters uses one bracketed paste. Thus, the receiving TUI cannot submit half
@@ -293,6 +305,8 @@ top-level session, so anything you do not pin explicitly runs on your MAIN
 (priciest) model, and that is the whole cost lever. Other agents (opencode or a
 wrapper that sets a custom endpoint) still launch by hand with
 `tmux split-window`; see the skill for that recipe.
+
+Spawn JSON reports `placement` as `right-stack`, `new-window`, or `vertical`.
 
 For Codex, `--sandbox danger-full-access --approval never` is the equivalent
 of Claude's `bypassPermissions`. It gives the worker no prompts and no sandbox.

@@ -70,6 +70,17 @@ class HerdletTest(unittest.TestCase):
         rec = self.parse(self.run_cli("get", "--id", "m1"))["result"]
         self.assertIsNone(rec["message"])
 
+    def test_report_if_state_is_compare_and_set(self):
+        self.parse(self.run_cli("report", "--id", "cas1", "--state", "blocked"))
+        h = _load_module()
+        rejected = h.call(self.sock, "agent.report", {
+            "id": "cas1", "state": "working", "if_state": "idle"})
+        self.assertFalse(rejected["result"]["applied"])
+        self.assertEqual(rejected["result"]["state"], "blocked")
+        applied = h.call(self.sock, "agent.report", {
+            "id": "cas1", "state": "working", "if_state": "blocked"})
+        self.assertEqual(applied["result"]["state"], "working")
+
     def test_get_unknown_fails(self):
         proc = self.run_cli("get", "--id", "nope")
         self.assertEqual(proc.returncode, 1)
@@ -428,6 +439,8 @@ class HerdletTest(unittest.TestCase):
                 codex = json.load(fh)
             self.assertIn("--agent codex --event Stop",
                           codex["hooks"]["Stop"][0]["hooks"][0]["command"])
+            self.assertIn("--agent codex --event PreCompact",
+                          codex["hooks"]["PreCompact"][0]["hooks"][0]["command"])
             self.assertTrue(os.path.exists(
                 os.path.join(home, ".claude", "skills", "herdlet", "SKILL.md")))
             self.assertTrue(os.path.exists(
@@ -574,6 +587,14 @@ class HerdletTest(unittest.TestCase):
         self.run_cli("hook", stdin=json.dumps({"hook_event_name": "PreCompact"}),
                      env_extra={"HERDLET_ID": "pc-ghost"})
         self.assertEqual(self.run_cli("get", "--id", "pc-ghost").returncode, 1)
+
+    def test_codex_precompact_uses_the_shared_compact_path(self):
+        self.parse(self.run_cli("report", "--id", "pc-codex", "--state", "working"))
+        self.run_cli("hook", "--agent", "codex", "--event", "PreCompact",
+                     env_extra={"HERDLET_ID": "pc-codex"})
+        rec = self.parse(self.run_cli("get", "--id", "pc-codex"))["result"]
+        self.assertEqual(rec["compacts"], 1)
+        self.assertEqual(rec["agent"], "codex")
 
     def test_hook_records_transcript_path(self):
         self.run_cli("hook", stdin=json.dumps(
@@ -799,7 +820,8 @@ class HerdletTest(unittest.TestCase):
         self.parse(self.run_cli("report", "--id", "sm/b", "--state", "idle",
                                 "--pane", "%3"))
         env, log = self.fake_tmux()
-        proc = self.run_cli("send", "--id", "sm/b", "orders", env_extra=env)
+        proc = self.run_cli("send", "--no-verify", "--id", "sm/b", "orders",
+                            env_extra=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         with open(log) as fh:
             self.assertIn("send-keys -t %3 -l -- orders", fh.read())
@@ -825,7 +847,7 @@ class HerdletTest(unittest.TestCase):
 
             env, log = self.fake_tmux()
             env["HERDLET_ID"] = "ps/dev"
-            proc = self.run_cli("send", "--id", "ps/test",
+            proc = self.run_cli("send", "--no-verify", "--id", "ps/test",
                                 "fixed in abc123,\nplease retest", env_extra=env)
             self.assertEqual(proc.returncode, 0, proc.stderr)
 
@@ -838,7 +860,8 @@ class HerdletTest(unittest.TestCase):
                 self.assertIn("%8", fh.read())
 
             # a second send adds a line but not a second heading
-            self.run_cli("send", "--id", "ps/test", "and the log?", env_extra=env)
+            self.run_cli("send", "--no-verify", "--id", "ps/test",
+                         "and the log?", env_extra=env)
             with open(topic) as fh:
                 body = fh.read()
             self.assertEqual(body.count("## Thread"), 1)
@@ -873,7 +896,8 @@ class HerdletTest(unittest.TestCase):
             env["HERDLET_ID"] = "nw/dev"
             sent = []
             timer = threading.Timer(0.3, lambda: sent.append(self.run_cli(
-                "send", "--id", "nw/test", "retest please", env_extra=env)))
+                "send", "--no-verify", "--id", "nw/test", "retest please",
+                env_extra=env)))
             timer.start()
             proc = self.run_cli("wait", "--id", "nw/master", "--state", "done",
                                 "--timeout", "1")
@@ -1562,7 +1586,7 @@ class VerifiedSendTest(unittest.TestCase):
         self.captures((CODEX_EMPTY_PANE, CODEX_PENDING_PANE, CODEX_EMPTY_PANE))
         self.assertEqual(
             self.h.verified_send("%1", "pending codex fixture", 0),
-            (True, True))
+            "sent")
         self.assertEqual(self.sent, [("%1", "pending codex fixture")])
         self.assertEqual(self.keys, [("send-keys", "-t", "%1", "Enter")])
 
@@ -1570,13 +1594,21 @@ class VerifiedSendTest(unittest.TestCase):
         self.captures((CODEX_EMPTY_PANE, CODEX_PENDING_PANE, CODEX_PENDING_PANE))
         self.assertEqual(
             self.h.verified_send("%1", "pending codex fixture", 0),
-            (True, False))
+            "stuck")
 
-    def test_sends_after_the_existing_input_does_not_clear(self):
-        self.captures((CLAUDE_PENDING_PANE, CLAUDE_EMPTY_PANE))
+    def test_does_not_send_when_existing_input_does_not_clear(self):
+        self.captures((CLAUDE_PENDING_PANE,))
         self.assertEqual(
             self.h.verified_send("%1", "another message", 0),
-            (False, True))
+            "draft")
+        self.assertEqual(self.sent, [])
+
+    def test_does_not_send_when_no_input_box_is_visible(self):
+        self.captures((CODEX_APPROVAL_MENU,))
+        self.assertEqual(
+            self.h.verified_send("%1", "another message", 0),
+            "no-input")
+        self.assertEqual(self.sent, [])
 
 
 class SendLockTest(unittest.TestCase):
@@ -1612,6 +1644,27 @@ class SendLockTest(unittest.TestCase):
             self.assertEqual(order, [
                 "first start", "first end", "second start", "second end"])
 
+    def test_daemon_prunes_only_old_send_lock_files(self):
+        h = _load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = os.path.join(directory, "herdlet.sock")
+            state_path = socket_path + ".state"
+            lock_dir = state_path + ".d"
+            os.makedirs(lock_dir)
+            old = os.path.join(lock_dir, "send-_8.lock")
+            fresh = os.path.join(lock_dir, "send-_9.lock")
+            unrelated = os.path.join(lock_dir, "keep.txt")
+            for path in (old, fresh, unrelated):
+                with open(path, "w"):
+                    pass
+            now = time.time()
+            os.utime(old, (now - h.MAX_AGE - 1, now - h.MAX_AGE - 1))
+            os.utime(unrelated, (now - h.MAX_AGE - 1, now - h.MAX_AGE - 1))
+            h.Bus(state_path=state_path)._prune_sweep()
+            self.assertFalse(os.path.exists(old))
+            self.assertTrue(os.path.exists(fresh))
+            self.assertTrue(os.path.exists(unrelated))
+
 
 class SendCommandTest(unittest.TestCase):
     def setUp(self):
@@ -1631,7 +1684,7 @@ class SendCommandTest(unittest.TestCase):
         return _Args(**base)
 
     def test_unsubmitted_text_exits_four_and_stays_in_the_prompt(self):
-        self.h.verified_send = lambda pane, text, settle: (True, False)
+        self.h.verified_send = lambda pane, text, settle, before: "stuck"
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             code = self.h.cmd_send(self.args())
@@ -1640,7 +1693,7 @@ class SendCommandTest(unittest.TestCase):
                       err.getvalue())
 
     def test_ack_is_skipped_for_an_unregistered_pane(self):
-        self.h.verified_send = lambda pane, text, settle: (True, True)
+        self.h.verified_send = lambda pane, text, settle, before: "sent"
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             code = self.h.cmd_send(self.args(ack=True))
@@ -1649,7 +1702,7 @@ class SendCommandTest(unittest.TestCase):
 
     def test_ack_timeout_exits_four(self):
         self.record = {"pane": "%4", "updated": 10}
-        self.h.verified_send = lambda pane, text, settle: (True, True)
+        self.h.verified_send = lambda pane, text, settle, before: before() or "sent"
         self.h.wait_for_send_ack = lambda *args: False
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
@@ -1657,13 +1710,23 @@ class SendCommandTest(unittest.TestCase):
         self.assertEqual(code, 4)
         self.assertIn("no hook acknowledgment arrived", err.getvalue())
 
-    def test_pending_input_writes_a_warning_but_still_succeeds(self):
-        self.h.verified_send = lambda pane, text, settle: (False, True)
+    def test_pending_input_exits_four_without_typing(self):
+        self.h.verified_send = lambda pane, text, settle, before: "draft"
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             code = self.h.cmd_send(self.args(settle=2))
-        self.assertEqual(code, 0)
-        self.assertIn("did not clear within 2s; sending anyway", err.getvalue())
+        self.assertEqual(code, 4)
+        self.assertIn("%4 still holds unsubmitted text; nothing typed", err.getvalue())
+
+    def test_menu_exits_six_without_typing_and_prints_the_tail(self):
+        self.h.verified_send = lambda pane, text, settle, before: "no-input"
+        self.h.capture_pane = lambda pane: CODEX_APPROVAL_MENU
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = self.h.cmd_send(self.args())
+        self.assertEqual(code, 6)
+        self.assertIn("no input box on %4; nothing typed", err.getvalue())
+        self.assertIn("Press enter to confirm or esc to cancel", err.getvalue())
 
     def test_no_verify_uses_the_old_send_path(self):
         sent = []
@@ -1673,16 +1736,16 @@ class SendCommandTest(unittest.TestCase):
             self.h.cmd_send(self.args(no_verify=True, no_enter=True)), 0)
         self.assertEqual(sent, [("%4", "hello", True)])
 
-    def test_no_enter_requires_no_verify(self):
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as exc:
-            self.h.cmd_send(self.args(no_enter=True))
-        self.assertEqual(exc.exception.code, 1)
-        self.assertIn("--no-enter requires --no-verify", err.getvalue())
+    def test_no_enter_implies_no_verify(self):
+        sent = []
+        self.h.send_text = lambda pane, text, no_enter: sent.append(
+            (pane, text, no_enter))
+        self.assertEqual(self.h.cmd_send(self.args(no_enter=True)), 0)
+        self.assertEqual(sent, [("%4", "hello", True)])
 
     def test_json_describes_a_verified_acknowledged_send(self):
         self.record = {"pane": "%4", "updated": 10}
-        self.h.verified_send = lambda pane, text, settle: (True, True)
+        self.h.verified_send = lambda pane, text, settle, before: before() or "sent"
         self.h.wait_for_send_ack = lambda *args: True
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -1691,6 +1754,42 @@ class SendCommandTest(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue())["result"], {
             "type": "sent", "id": "%4", "pane": "%4",
             "verified": True, "acknowledged": True})
+
+    def test_concurrent_identical_sends_use_their_own_ack_baselines(self):
+        current = {"pane": "%4", "updated": 10}
+        baselines = []
+        first_before_send = threading.Event()
+        release_first = threading.Event()
+        results = []
+        self.h.send_record = lambda socket, agent_id: dict(current)
+
+        def send(pane, text, settle, before):
+            before()
+            if not first_before_send.is_set():
+                first_before_send.set()
+                release_first.wait(2)
+            return "sent"
+
+        def ack(socket, agent_id, text, updated, settle):
+            baselines.append(updated)
+            current["updated"] = updated + 10
+            return True
+
+        self.h.verified_send = send
+        self.h.wait_for_send_ack = ack
+        first = threading.Thread(
+            target=lambda: results.append(self.h.cmd_send(self.args(ack=True))))
+        second = threading.Thread(
+            target=lambda: results.append(self.h.cmd_send(self.args(ack=True))))
+        first.start()
+        self.assertTrue(first_before_send.wait(1))
+        second.start()
+        time.sleep(0.05)
+        release_first.set()
+        first.join(2)
+        second.join(2)
+        self.assertEqual(results, [0, 0])
+        self.assertEqual(baselines, [10, 20])
 
 
 class SpawnLineTest(unittest.TestCase):
@@ -1737,6 +1836,7 @@ class SpawnLineTest(unittest.TestCase):
         self.assertTrue(self.h.codex_prompt_ready("Ask Codex to do anything\n"))
         self.assertTrue(self.h.codex_prompt_ready("  › Ask Codex to do anything  \n"))
         self.assertTrue(self.h.codex_prompt_ready("ASK CODEX TO DO ANYTHING\n"))
+        self.assertFalse(self.h.codex_prompt_ready("› Ask Codex to do\n  anything\n"))
         self.assertFalse(self.h.codex_prompt_ready("› 1. Yes, continue\n2. No, quit"))
 
     def test_codex_trust_prompt_matcher(self):
@@ -2005,9 +2105,11 @@ class SpawnCommandTest(_DaemonCase):
 
     def test_codex_registers_and_uses_the_input_prompt_for_readiness(self):
         original = self.h.tmux
+        captures = []
 
         def tmux(*args, **kw):
             if args[0] == "capture-pane":
+                captures.append(args)
                 return "› Ask Codex to do anything\n"
             return original(*args, **kw)
 
@@ -2021,6 +2123,8 @@ class SpawnCommandTest(_DaemonCase):
         self.assertEqual((rec["model"], rec["effort"]), ("gpt-5.6-sol", "low"))
         self.assertEqual(err, "")
         self.assertEqual(code, 0)
+        self.assertTrue(captures)
+        self.assertTrue(all("-J" in args for args in captures))
 
     def test_ready_worker_gets_its_brief_with_an_absolute_path(self):
         brief = os.path.join(self.tmp.name, "b.md")
@@ -2195,6 +2299,14 @@ class SpawnCommandTest(_DaemonCase):
         self.assertFalse(payload["ready"])
         self.assertFalse(payload["brief_sent"])
 
+    def test_vertical_json_reports_vertical_placement(self):
+        self.ready_in(0.15)
+        code, out, err = self.spawn(vertical=True, json=True, ready_timeout=3)
+        self.assertEqual(json.loads(out)["result"]["placement"], "vertical")
+        splits = [args for args in self.runs if args[0] == "split-window"]
+        self.assertIn("-v", splits[0])
+        self.assertEqual(code, 0)
+
 
 class ApproveTimeoutTest(_DaemonCase):
     def setUp(self):
@@ -2255,6 +2367,33 @@ class ApproveTimeoutTest(_DaemonCase):
         self.assertIn("state: timeout", out)   # still says so, just exits 0
         self.assertEqual(code, 0)
 
+    def test_done_record_is_not_overwritten_and_plain_wait_returns(self):
+        self.h.call(self.sock, "agent.report", {"id": "ap/one", "state": "done"})
+        calls = []
+        real = self.h.call
+
+        def track(sock, method, params, timeout=5.0):
+            if method == "wait":
+                calls.append(params)
+            return real(sock, method, params, timeout)
+
+        self.h.call = track
+        code, out, err = self.approve()
+        self.assertEqual(code, 0)
+        self.assertIn("state: done", out)
+        self.assertEqual(self.record("ap/one")["state"], "done")
+        self.assertNotIn("edge", calls[0])
+
+    def test_done_during_settle_is_returned_without_an_edge_wait(self):
+        timer = threading.Timer(0.05, lambda: self.h.call(
+            self.sock, "agent.report", {"id": "ap/one", "state": "done"}))
+        timer.start()
+        code, out, err = self.approve(settle=0.2, timeout=1)
+        timer.join()
+        self.assertEqual(code, 0)
+        self.assertIn("state: done", out)
+        self.assertEqual(self.record("ap/one")["state"], "done")
+
     def test_no_menu_types_nothing_and_clears_stale_blocked(self):
         self.screen = CLAUDE_EMPTY_PANE
         code, out, err = self.approve(wait=False)
@@ -2291,11 +2430,66 @@ class PaneKillGuardTest(unittest.TestCase):
     def test_ended_agent_can_be_killed(self):
         self.assertTrue(self.h.pane_kill_allowed({"state": "ended"}, "claude"))
 
-    def test_shell_can_be_killed_for_a_nonterminal_record(self):
-        self.assertTrue(self.h.pane_kill_allowed({"state": "working"}, "zsh"))
+    def test_fresh_wrapper_worker_at_a_shell_is_refused(self):
+        rec = {"state": "working", "updated": time.time()}
+        self.assertFalse(self.h.pane_kill_allowed(rec, "zsh"))
+
+    def test_stale_shell_worker_can_be_killed(self):
+        now = time.time()
+        rec = {"state": "working", "updated": now - self.h.STALE_AFTER - 1}
+        self.assertTrue(self.h.pane_kill_allowed(rec, "zsh", now=now))
+
+    def test_force_kills_a_fresh_wrapper_worker(self):
+        rec = {"state": "working", "updated": time.time()}
+        self.assertTrue(self.h.pane_kill_allowed(rec, "zsh", force=True))
 
     def test_live_nonterminal_agent_is_refused(self):
         self.assertFalse(self.h.pane_kill_allowed({"state": "working"}, "node"))
+
+    def test_vanished_pane_does_not_abort_the_batch(self):
+        def tmux(*args, **kw):
+            if args[0] == "display-message":
+                return "%4\tnode\n"
+            return None
+
+        self.h.tmux = tmux
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            killed = self.h.kill_record_pane(
+                "worker/a", {"state": "done", "pane": "%4"})
+        self.assertFalse(killed)
+        self.assertIn("worker/a: pane %4 vanished", err.getvalue())
+
+
+class AckKillBatchTest(_DaemonCase):
+    def setUp(self):
+        super().setUp()
+        self.kills = []
+        self.h.call(self.sock, "agent.report",
+                    {"id": "batch/a", "state": "done", "pane": "%4"})
+        self.h.call(self.sock, "agent.report",
+                    {"id": "batch/b", "state": "done", "pane": "%5"})
+
+        def tmux(*args, **kw):
+            pane = args[args.index("-t") + 1]
+            if args[0] == "display-message":
+                return f"{pane}\tnode\n"
+            self.kills.append(pane)
+            return None if pane == "%4" else ""
+
+        self.h.tmux = tmux
+
+    def test_vanished_first_pane_does_not_abort_the_batch(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = self.h.cmd_ack(_Args(
+                socket=self.sock, id="batch/a,batch/b", kill_pane=True,
+                force=False))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.kills, ["%4", "%5"])
+        self.assertEqual(self.record("batch/a")["state"], "idle")
+        self.assertEqual(self.record("batch/b")["state"], "idle")
+        self.assertIn("batch/a: pane %4 vanished", err.getvalue())
 
 
 class TimeoutResultTest(unittest.TestCase):

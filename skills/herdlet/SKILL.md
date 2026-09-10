@@ -190,7 +190,8 @@ git diff | herdlet send --id builder --file -        # or from stdin
 the text is typed into that agent's terminal and submitted with Enter, as if
 its human had typed it. sends to one pane are serialized. `send` waits up to
 five seconds for existing input to clear before it types. if the input stays,
-it sends the message and writes a warning to stderr.
+it exits 4 and types nothing. if no input box is visible, it exits 6 and shows
+the pane tail.
 
 if the target agent is mid-turn, the message queues as normal user input.
 
@@ -202,8 +203,8 @@ pass `--ack` to wait for the target hook to record the prompt and the `working`
 state. an unregistered pane has no hooks, so `send` skips this wait and writes a
 note. pass `--json` to print the send result.
 
-pass `--no-verify` for the old fire-and-forget behavior. `--no-enter` requires
-`--no-verify` and types without submission.
+pass `--no-verify` to bypass both input checks and use fire-and-forget behavior.
+`--no-enter` implies `--no-verify` and types without submission.
 
 if YOU are a worker (`$HERDLET_ID` is set), `send` only reaches your peers - the
 agents the master paired you with, plus any worker you spawned yourself.
@@ -376,6 +377,7 @@ the human's focus is. (`herdlet spawn` does this for you.)
 right half. it gives the right workers equal heights. a window under 160
 columns or a stack below `--min-height 12` puts the worker in a new window.
 pass `--vertical` to use the old explicit vertical split.
+spawn JSON reports `placement` as `right-stack`, `new-window`, or `vertical`.
 
 after they register you drive them with `send` / `wait` / `peek` cycles.
 
@@ -482,8 +484,9 @@ read the outcome in the topic file and in their reports.
 after collecting a worker's result, `herdlet ack --id <worker>` clears it from
 the inbox: a `done` (still-alive) worker flips back to `idle`, an `ended` (dead)
 one is removed. then `list` reads as an inbox of live work.
-pass `--kill-pane` to `ack` or `remove` to close a finished pane or a pane at a
-shell. the command leaves a live nonterminal agent open and writes a note.
+pass `--kill-pane` to `ack` or `remove` to close a finished pane or a stale shell
+pane. the command leaves a fresh wrapper worker open. pass `--force` to override
+this guard.
 switching projects means a new window; leave finished windows alive so the
 user can inspect them.
 
