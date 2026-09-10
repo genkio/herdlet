@@ -1123,6 +1123,14 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(snap["peers"], [])
         self.assertEqual(snap["topics"], {})
 
+    def test_a_record_without_an_instance_reads_as_zero(self):
+        h = _load_module()
+        bus = h.Bus()
+        bus.agents["legacy"] = {"state": "idle", "pane": "%1", "message": None,
+                                "agent": "claude", "session": None, "cwd": None,
+                                "updated": time.time()}
+        self.assertEqual(bus.snapshot("legacy")["instance"], 0)
+
     def test_a_real_count_is_not_overwritten_by_the_default(self):
         h = _load_module()
         bus = h.Bus()
@@ -2634,6 +2642,111 @@ class TranscriptParseTest(unittest.TestCase):
                                                       "content": "hi"}}) + "\n")
         self.assertEqual(self.h.transcript_messages(path, 5),
                          [(None, "plain"), ("t2", "codex")])
+
+
+class InstanceTest(unittest.TestCase):
+    """Records carry an occupant instance, bumped when the id changes pane."""
+
+    def setUp(self):
+        self.h = _load_module()
+        self.bus = self.h.Bus()
+
+    def test_a_new_record_gets_a_fresh_instance(self):
+        self.bus.report("a", {"state": "working", "pane": "%1"})
+        self.bus.report("b", {"state": "working", "pane": "%2"})
+        self.assertNotEqual(self.bus.agents["a"]["instance"],
+                            self.bus.agents["b"]["instance"])
+
+    def test_the_same_pane_keeps_its_instance(self):
+        self.bus.report("a", {"state": "working", "pane": "%1"})
+        first = self.bus.agents["a"]["instance"]
+        self.bus.report("a", {"state": "done", "pane": "%1"})
+        self.assertEqual(self.bus.agents["a"]["instance"], first)
+
+    def test_a_new_pane_gets_a_new_instance(self):
+        self.bus.report("a", {"state": "working", "pane": "%1"})
+        first = self.bus.agents["a"]["instance"]
+        self.bus.report("a", {"state": "done", "pane": "%2"})
+        self.assertNotEqual(self.bus.agents["a"]["instance"], first)
+
+    def test_clearing_the_pane_does_not_bump(self):
+        self.bus.report("a", {"state": "working", "pane": "%1"})
+        first = self.bus.agents["a"]["instance"]
+        self.bus.report("a", {"state": "done", "pane": ""})
+        self.assertEqual(self.bus.agents["a"]["instance"], first)
+
+    def test_a_restart_does_not_reuse_a_persisted_instance(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.state")
+            first = self.h.Bus(state_path=path)
+            first.report("a", {"state": "working", "pane": "%1"})
+            highest = first.agents["a"]["instance"]
+            second = self.h.Bus(state_path=path)
+            second.report("b", {"state": "working", "pane": "%2"})
+            self.assertGreater(second.agents["b"]["instance"], highest)
+
+
+class WaitPinningTest(_DaemonCase):
+    """A wait pins the occupant it started on."""
+
+    def wait(self, *args):
+        return subprocess.run(
+            [sys.executable, BIN, "--socket", self.sock, "wait", *args],
+            capture_output=True, text=True, timeout=15)
+
+    def report(self, agent_id, state, pane):
+        self.h.call(self.sock, "agent.report",
+                    {"id": agent_id, "state": state, "pane": pane})
+
+    def test_a_replacement_on_a_new_pane_does_not_satisfy_a_wait(self):
+        self.report("w", "working", "%1")
+        result = {}
+
+        def waiter():
+            result["proc"] = self.wait(
+                "--id", "w", "--state", "done", "--timeout", "1.5")
+
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        time.sleep(0.3)
+        self.report("w", "done", "%2")  # a different occupant under the same id
+        thread.join(5)
+        self.assertEqual(result["proc"].returncode, 2, result["proc"].stdout)
+        # the replacement itself is waitable: it is a fresh pin
+        fresh = self.wait("--id", "w", "--state", "done", "--timeout", "2")
+        self.assertEqual(fresh.returncode, 0, fresh.stderr)
+        self.assertTrue(json.loads(fresh.stdout)["result"]["already"])
+
+    def test_the_same_occupant_still_satisfies_a_wait(self):
+        self.report("w2", "working", "%1")
+        result = {}
+
+        def waiter():
+            result["proc"] = self.wait(
+                "--id", "w2", "--state", "done", "--timeout", "5")
+
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        time.sleep(0.3)
+        self.report("w2", "done", "%1")
+        thread.join(5)
+        self.assertEqual(result["proc"].returncode, 0, result["proc"].stderr)
+        self.assertEqual(json.loads(result["proc"].stdout)["result"]["state"], "done")
+
+    def test_removing_the_pinned_record_does_not_wake_the_wait(self):
+        self.report("w3", "working", "%1")
+        result = {}
+
+        def waiter():
+            result["proc"] = self.wait(
+                "--id", "w3", "--state", "done", "--timeout", "1.5")
+
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        time.sleep(0.3)
+        self.h.call(self.sock, "agent.remove", {"id": "w3"})
+        thread.join(5)
+        self.assertEqual(result["proc"].returncode, 2, result["proc"].stdout)
 
 
 class DaemonElectionTest(unittest.TestCase):

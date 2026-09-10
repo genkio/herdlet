@@ -103,6 +103,7 @@ class Bus:
         self._reemit = {}      # id -> TimerHandle: live re-announce of `blocked`
         self._limit_timer = None
         self._limit_task = None
+        self._instance = 0     # bumped per record occupant (see report)
         self._load()
 
     def _load(self):
@@ -115,6 +116,9 @@ class Bus:
                 self.agents = data["agents"]
         except (OSError, json.JSONDecodeError):
             pass  # best-effort: a bad snapshot just means an empty registry
+        # never hand a persisted occupant the instance number a new one will get
+        self._instance = max((int(rec.get("instance") or 0)
+                              for rec in self.agents.values()), default=0)
         # GC on load: drop cleanly-finished records after TERMINAL_TTL and any
         # record untouched past MAX_AGE (see _prunable), so a restart clears the
         # days-dead panes a terminal-only TTL would keep forever.
@@ -148,11 +152,16 @@ class Bus:
 
     def snapshot(self, agent_id):
         rec = self.agents.get(agent_id)
-        # compacts/peers defaulted here so a record written by an older daemon
-        # still answers the questions `get` is asked
+        # compacts/peers/instance defaulted here so a record written by an
+        # older daemon still answers the questions `get` is asked
         if not rec:
             return None
-        return {"id": agent_id, "compacts": 0, "peers": [], "topics": {}, **rec}
+        return {"id": agent_id, "compacts": 0, "peers": [], "topics": {},
+                "instance": 0, **rec}
+
+    def _next_instance(self):
+        self._instance += 1
+        return self._instance
 
     def report(self, agent_id, params):
         rec = self.agents.get(agent_id)
@@ -165,12 +174,16 @@ class Bus:
                     **(self.snapshot(agent_id) or {}),
                     "applied": False}
         if rec is None:
-            rec = self.agents.setdefault(agent_id, {
-                "state": "unknown", "message": None, "agent": None,
-                "pane": None, "cwd": None, "session": None, "transcript": None,
-                "model": None, "effort": None, "compacts": 0,
-                "peers": [], "topics": {}, "updated": 0.0,
-            })
+            rec = {"state": "unknown", "message": None, "agent": None,
+                   "pane": None, "cwd": None, "session": None, "transcript": None,
+                   "model": None, "effort": None, "compacts": 0,
+                   "peers": [], "topics": {}, "updated": 0.0,
+                   "instance": self._next_instance()}
+            self.agents[agent_id] = rec
+        elif params.get("pane") and params["pane"] != rec.get("pane"):
+            # the id now names a different occupant (a re-registered pane); a
+            # waiter pinned to the old occupant must not be woken by this one
+            rec["instance"] = self._next_instance()
         state = params.get("state") or rec["state"]
         rec["state"] = state
         for key in MERGE_KEYS:
@@ -502,8 +515,25 @@ async def _handle_wait(writer, bus, rid, params):
         _send(writer, {"id": rid, "error": {"code": "invalid_params"}})
         return
 
+    # Pin the occupant each named id currently resolves to. A wait names a
+    # pane occupant, not just a string: if the id is re-registered on another
+    # pane (or removed), the old waiter must not be satisfied by the new one.
+    # Ids with no record are deliberately unpinned: waiting for a not-yet
+    # registered agent (`spawn` then wait) must still wake on its first report.
+    pins = {}
+    for agent_id in ids:
+        rec = bus.agents.get(agent_id)
+        if rec is not None:
+            pins[agent_id] = rec.get("instance") or 0
+
     def matches(agent_id):
-        return agent_id in ids or (prefix is not None and agent_id.startswith(prefix))
+        if not (agent_id in ids
+                or (prefix is not None and agent_id.startswith(prefix))):
+            return False
+        if agent_id not in pins:
+            return True
+        rec = bus.agents.get(agent_id)
+        return rec is not None and (rec.get("instance") or 0) == pins[agent_id]
 
     def matched_now():
         # every currently-matching agent already in a target state, so a herd
