@@ -38,7 +38,10 @@ class HerdletTest(unittest.TestCase):
         cls.tmp.cleanup()
 
     @classmethod
-    def run_cli(cls, *args, stdin=None, env_extra=None):
+    def run_cli(cls, *args, stdin="", env_extra=None):
+        # stdin defaults to empty, never inherited: `hook` reads stdin to EOF
+        # when it is not a tty, and a runner started from an open pipe would
+        # block the hook for the whole 15 s and fail the test
         env = dict(os.environ)
         env.pop("TMUX_PANE", None)
         env.pop("HERDLET_ID", None)
