@@ -26,7 +26,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 EXIT_TIMEOUT = 2
 EXIT_SCOPE = 3
