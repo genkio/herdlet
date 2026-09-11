@@ -181,9 +181,14 @@ class Bus:
                    "peers": [], "topics": {}, "updated": 0.0,
                    "instance": self._next_instance()}
             self.agents[agent_id] = rec
-        elif params.get("pane") and params["pane"] != rec.get("pane"):
-            # the id now names a different occupant (a re-registered pane); a
-            # waiter pinned to the old occupant must not be woken by this one
+        elif params.get("pane") and (
+                params["pane"] != rec.get("pane")
+                or (params.get("tmux") and rec.get("tmux")
+                    and params["tmux"] != rec["tmux"])):
+            # the id now names a different occupant (a re-registered pane, or
+            # the same pane number on another tmux server); a waiter pinned to
+            # the old occupant must not be woken by this one. A record written
+            # before the tmux key existed gains it without a bump.
             rec["instance"] = self._next_instance()
         state = params.get("state") or rec["state"]
         rec["state"] = state
@@ -871,10 +876,6 @@ def resolve_target(sock_path, agent_id):
     if agent_id.startswith("%"):
         return agent_id, None
     die(f"unknown agent '{agent_id}' (see: herdlet list)")
-
-
-def resolve_pane(sock_path, agent_id):
-    return resolve_target(sock_path, agent_id)[0]
 
 
 def cmd_ping(args):
@@ -1669,9 +1670,9 @@ def cmd_send(args):
             else:
                 result = verified_send(pane, text, args.settle, baseline)
             verified = result == "sent"
-            at_shell = (pane_is_shell(pane, server) if server
-                        else pane_is_shell(pane))
-            if result == "no-input" and at_shell:
+            at_shell = result == "no-input" and (
+                pane_is_shell(pane, server) if server else pane_is_shell(pane))
+            if at_shell:
                 # a bare shell has no input box to detect; type the line
                 send_text(pane, text, args.no_enter, server) if server else \
                     send_text(pane, text, args.no_enter)

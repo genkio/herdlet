@@ -2827,6 +2827,19 @@ class InstanceTest(unittest.TestCase):
         self.bus.report("a", {"state": "done", "pane": "%2"})
         self.assertNotEqual(self.bus.agents["a"]["instance"], first)
 
+    def test_the_same_pane_number_on_another_server_bumps(self):
+        self.bus.report("a", {"state": "working", "pane": "%1", "tmux": "/tmp/a"})
+        first = self.bus.agents["a"]["instance"]
+        self.bus.report("a", {"state": "done", "pane": "%1", "tmux": "/tmp/b"})
+        self.assertNotEqual(self.bus.agents["a"]["instance"], first)
+
+    def test_a_record_without_a_server_gains_one_without_a_bump(self):
+        self.bus.report("a", {"state": "working", "pane": "%1"})
+        first = self.bus.agents["a"]["instance"]
+        self.bus.report("a", {"state": "done", "pane": "%1", "tmux": "/tmp/a"})
+        self.assertEqual(self.bus.agents["a"]["instance"], first)
+        self.assertEqual(self.bus.agents["a"]["tmux"], "/tmp/a")
+
     def test_clearing_the_pane_does_not_bump(self):
         self.bus.report("a", {"state": "working", "pane": "%1"})
         first = self.bus.agents["a"]["instance"]

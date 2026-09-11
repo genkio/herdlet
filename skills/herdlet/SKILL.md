@@ -191,7 +191,8 @@ the text is typed into that agent's terminal and submitted with Enter, as if
 its human had typed it. sends to one pane are serialized. `send` waits up to
 five seconds for existing input to clear before it types. if the input stays,
 it exits 4 and types nothing. if no input box is visible, it exits 6 and shows
-the pane tail.
+the pane tail - unless the pane sits at a bare shell, where there is nothing to
+detect: then it types the line unverified and says so on stderr.
 
 if the target agent is mid-turn, the message queues as normal user input.
 
