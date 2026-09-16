@@ -1435,6 +1435,36 @@ SEND_PASTE_OVER = 200
 SEND_POLL_INTERVAL = 0.1
 
 
+# pi draws no prompt marker at all: its input box is the region between the last
+# two rule lines above the status footer. The footer is anchored on the two
+# numbers every footer carries - context usage and cost - never on the model
+# block: a custom footer extension reorders it, and a narrow pane truncates it to
+# "(fireworks) accounts/fireworks/mod...". Both are required together, so a chat
+# line that happens to quote a percentage cannot pass as a footer.
+PI_USAGE_RE = re.compile(r"\d+(?:\.\d+)?%/\d+[kKmM]\b")
+PI_COST_RE = re.compile(r"\$\d")
+PI_RULE_RE = re.compile(r"^\u2500{10,}\s*$")
+
+
+def pi_footer(line):
+    return bool(PI_USAGE_RE.search(line) and PI_COST_RE.search(line))
+
+
+def pi_input_text(lines):
+    tail = [i for i, line in enumerate(lines) if line.strip()][-3:]
+    footer = next((i for i in tail if pi_footer(lines[i])), None)
+    if footer is None:
+        return None
+    rules = [i for i in range(footer) if PI_RULE_RE.match(lines[i])]
+    if len(rules) < 2:
+        return None
+    # verbatim: a draft's own indentation is part of what the human typed
+    box = lines[rules[-2] + 1:rules[-1]]
+    while box and not box[-1].strip():
+        box.pop()
+    return "\n".join(box)
+
+
 def pane_input_text(capture):
     """Pending TUI input, '' for an empty box, or None when no box is visible."""
     lines = capture.replace("\u00a0", " ").splitlines()
@@ -1456,7 +1486,7 @@ def pane_input_text(capture):
                 break
             parts.append(stripped)
         return "\n".join(parts)
-    return None
+    return pi_input_text(lines)
 
 
 def wait_for_empty_input(pane, settle, server=None):
@@ -1817,7 +1847,7 @@ def brief_title(path):
 
 def spawn_line(agent_id, model, effort, title, permission_mode,
                env=(), program="claude", program_args=(), sandbox=None,
-               approval=None):
+               approval=None, provider=None):
     parts = list(SPAWN_ENV) + [f"HERDLET_ID={shlex.quote(agent_id)}"]
     for pair in env:
         key, sep, value = pair.partition("=")
@@ -1836,6 +1866,16 @@ def spawn_line(agent_id, model, effort, title, permission_mode,
                   "-c", shlex.quote(f"model_reasoning_effort={effort}"),
                   "--sandbox", shlex.quote(sandbox or "workspace-write"),
                   "-a", shlex.quote(approval or "on-request")]
+    elif program == "pi":
+        parts += ["pi",
+                  "--name", shlex.quote(f"{agent_id}: {title}"),
+                  "--model", shlex.quote(model),
+                  "--thinking", shlex.quote(effort)]
+        if provider:
+            parts += ["--provider", shlex.quote(provider)]
+        if sandbox == "read-only":
+            # pi has no sandbox; a read-only worker is one without edit/write/bash
+            parts += ["--tools", "read,grep,find,ls"]
     else:
         parts += [shlex.quote(program)] + [shlex.quote(a) for a in program_args]
     return " ".join(parts)
@@ -2008,19 +2048,31 @@ def write_spawn_allowlist(agent, cwd, values):
 
 
 def cmd_spawn(args):
-    if args.agent not in ("claude", "codex"):
-        die("spawn supports claude and codex only; launch other agents by hand (see README)")
+    if args.agent not in ("claude", "codex", "pi"):
+        die("spawn supports claude, codex and pi only; "
+            "launch other agents by hand (see README)")
     if args.min_height < 1:
         die("--min-height must be one or more")
     sandbox = getattr(args, "sandbox", None)
     approval = getattr(args, "approval", None)
     permission_mode = getattr(args, "permission_mode", None)
+    provider = getattr(args, "provider", None)
     if args.agent == "claude" and sandbox is not None:
         die("--sandbox is only valid with --agent codex")
-    if args.agent == "claude" and approval is not None:
+    if args.agent != "codex" and approval is not None:
         die("--approval is only valid with --agent codex")
     if args.agent == "codex" and permission_mode is not None:
         die("--permission-mode is claude-only; use --sandbox and --approval instead")
+    if args.agent != "pi" and provider is not None:
+        die("--provider is only valid with --agent pi")
+    if args.agent == "pi":
+        if permission_mode is not None:
+            die("--permission-mode is claude-only; pi has no permission modes")
+        if sandbox is not None and sandbox != "read-only":
+            die("pi has no sandbox; only --sandbox read-only is supported "
+                f"(it maps to a tools allowlist), not {sandbox}")
+        if getattr(args, "allow", None):
+            die("pi has no permission prompts, so there is no allowlist; drop --allow")
     caller = os.environ.get("TMUX_PANE")
     if not caller:
         die("spawn must run inside tmux")
@@ -2034,7 +2086,7 @@ def cmd_spawn(args):
     program = getattr(args, "program", None) or args.agent
     line = spawn_line(args.id, args.model, args.effort, title,
                       permission_mode or "auto", args.env or (), program,
-                      args.program_args or (), sandbox, approval)
+                      args.program_args or (), sandbox, approval, provider)
 
     fallback = None
     placement = "vertical" if args.vertical else "right-stack"
@@ -2070,13 +2122,15 @@ def cmd_spawn(args):
               "model": args.model, "effort": args.effort,
               "tmux": tmux_socket(),
               "message": f"spawning: {title}"}
-    if args.agent == "codex" or not spawn_ready(args.socket, args.id, pane):
+    if args.agent in ("codex", "pi") or not spawn_ready(args.socket, args.id, pane):
         params["state"] = "spawning"  # else a hook beat us here; don't undo it
     call_or_die(args.socket, "agent.report", params)
     pair_with_spawner(args.socket, args.id, brief, cwd)
 
     if args.agent == "codex":
         ready = wait_for_codex_prompt(pane, args.ready_timeout)
+    elif args.agent == "pi":
+        ready = wait_for_pi_prompt(pane, args.ready_timeout)
     else:
         if args.ready_timeout > 0:
             call_or_die(args.socket, "wait", {
@@ -2108,8 +2162,8 @@ def cmd_spawn(args):
     if not ready:
         brief_note = ("; the brief was not sent, send it once the prompt is "
                       "cleared" if brief else "")
-        wait_note = ("did not show its input prompt" if args.agent == "codex"
-                     else "did not report")
+        wait_note = ("did not show its input prompt"
+                     if args.agent in ("codex", "pi") else "did not report")
         print(f"warning: {args.id} {wait_note} in {args.ready_timeout}s; "
               f"pane {pane} is alive, peek/approve it by pane id{brief_note}",
               file=sys.stderr)
@@ -2167,6 +2221,26 @@ def wait_for_codex_prompt(pane, timeout):
         if not trust_answered and codex_trust_prompt(text):
             tmux("send-keys", "-t", pane, "Enter", check=True)
             trust_answered = True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.1, remaining))
+
+
+def pi_prompt_ready(text):
+    lines = text.splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines or not pi_footer(lines[-1]):
+        return False
+    return sum(1 for line in lines[-14:-1] if PI_RULE_RE.match(line)) >= 2
+
+
+def wait_for_pi_prompt(pane, timeout):
+    deadline = time.monotonic() + max(0, timeout)
+    while True:
+        if pi_prompt_ready(capture_pane(pane)):
+            return True
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False
@@ -2650,20 +2724,26 @@ def main():
                         "pane: the last --lines assistant messages, verbatim")
     p.set_defaults(fn=cmd_peek)
 
-    p = sub.add_parser("spawn", help="launch a Claude Code or Codex worker in a new pane and register it")
+    p = sub.add_parser("spawn", help="launch a Claude Code, Codex or pi worker in a new pane and register it")
     p.add_argument("--id", required=True, help="agent id, e.g. myproject/dev")
     p.add_argument("--model", required=True, help="model id (never inherit the default)")
     p.add_argument("--effort", required=True,
-                   choices=("low", "medium", "high", "xhigh"))
-    p.add_argument("--agent", default="claude", help="agent kind: claude or codex (default: claude)")
+                   choices=("off", "minimal", "low", "medium", "high",
+                            "xhigh", "max"),
+                   help="reasoning effort; pi maps it to --thinking, so its "
+                        "off/minimal/max levels are pi-only")
+    p.add_argument("--agent", default="claude",
+                   help="agent kind: claude, codex or pi (default: claude)")
     p.add_argument("--title", help="one-line purpose (default: the brief's first heading)")
     p.add_argument("--brief", help="brief file; the worker is told to read it and do it")
     p.add_argument("--cwd", help="worker's working directory (default: yours)")
     p.add_argument("--permission-mode", help="Claude permission mode (default: auto)")
     p.add_argument("--sandbox", choices=("read-only", "workspace-write", "danger-full-access"),
-                   help="Codex sandbox mode (default: workspace-write)")
+                   help="Codex sandbox mode (default: workspace-write); with "
+                        "pi only read-only, which limits its tools")
     p.add_argument("--approval", choices=("on-request", "never"),
                    help="Codex approval policy (default: on-request)")
+    p.add_argument("--provider", help="pi provider name (pi only)")
     p.add_argument("--allow", action="append", metavar="COMMAND_PREFIX",
                    help="pre-allow a command prefix in the worker cwd (repeatable)")
     p.add_argument("--env", action="append", metavar="K=V",
