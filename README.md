@@ -1,6 +1,6 @@
 # herdlet
 
-Tiny coordination bus for coding agents (Claude Code, Codex, opencode, ...)
+Tiny coordination bus for coding agents (Claude Code, Codex, opencode, pi, ...)
 running in tmux panes.
 
 tmux already gives you the multiplexing and the pane I/O (`send-keys`,
@@ -39,7 +39,8 @@ herdlet setup                # wire hooks + skill + permissions, one time
 Or just drop `herdlet.py` somewhere on your PATH.
 
 `herdlet setup` wires the Claude Code / Codex hooks (backing up the settings
-files it touches), installs the agent skill, and allowlists `Bash(herdlet:*)`.
+files it touches), installs the opencode plugin and the pi extension, installs
+the agent skill, and allowlists `Bash(herdlet:*)`.
 Add `--allow-tmux` if agents should also spawn panes unprompted. It is
 idempotent and leaves everything else in your settings alone. Prefer manual
 wiring? The snippets are below.
@@ -76,6 +77,7 @@ herdlet wait --id builder --match 'tests? passed|ERROR' --timeout 600  # wait on
 
 herdlet spawn --id myproject/dev --model sonnet --effort medium --brief plans/dev.md  # new pane, registered from t=0
 herdlet spawn --agent codex --id myproject/review --model gpt-5.6-sol --effort low --sandbox read-only --allow "git status"
+herdlet spawn --agent pi --id myproject/audit --model openai-codex/gpt-5.6-sol --effort low --provider openai-codex --sandbox read-only
 herdlet send --id builder "run the tests again"  # types into builder's pane + Enter
 herdlet send --id builder --file plans/next.md   # long or multi-line message from a file ('-' = stdin)
 herdlet peek --id builder --lines 40             # read builder's recent output (--join unwraps soft wraps)
@@ -159,7 +161,7 @@ characters uses one bracketed paste. Thus, the receiving TUI cannot submit half
 of the text. A plain shell uses canonical tty mode and drops an input line over
 1023 characters. Agent TUIs use raw mode and do not have this limit.
 
-## Automatic state from Claude Code / Codex hooks
+## Automatic state from Claude Code / Codex / pi hooks
 
 `herdlet hook` reads the hook JSON on stdin, maps events to states, and
 reports on behalf of the agent sitting in the pane. It auto-starts the daemon,
@@ -177,8 +179,8 @@ never blocks, and always exits 0, so it is safe in any hook chain.
 The prompt text becomes the agent's `message`, so `list` / `monitor` show
 what each agent is working on. Hooks also record the agent's native session
 id, which is what powers `herdlet resume` (types `claude --resume <id>` /
-`codex resume <id>` / `opencode --session <id>` into the pane after a crash or
-usage-limit kill). A finished session becomes `ended` rather than vanishing, so
+`codex resume <id>` / `opencode --session <id>` / `pi --session <id>` into the
+pane after a crash or usage-limit kill). A finished session becomes `ended` rather than vanishing, so
 you can still collect its output and resume it; `herdlet remove` (or `ack`)
 clears it. The registry self-cleans: terminal records are dropped 24h after
 finishing, and ANY record untouched for `HERDLET_MAX_AGE` (default 3d, 0
@@ -186,9 +188,11 @@ disables) is dropped whatever its state - the days-dead panes a terminal-only
 TTL never catches. A still-live agent just re-registers on its next hook; the
 daemon sweeps hourly and also on load.
 
-opencode has no shell-hook config, so `herdlet setup` installs a small plugin
-(`~/.config/opencode/plugins/herdlet.js`) that reports the same states from
-opencode's event stream.
+opencode and pi have no shell-hook config, so `herdlet setup` installs a small
+bridge for each - `~/.config/opencode/plugins/herdlet.js` and
+`~/.pi/agent/extensions/herdlet.ts` - that reports the same states from their
+event streams. The pi extension only reports in TUI mode, and only when
+`HERDLET_ID` or `TMUX_PANE` is set.
 
 Hooks also record each agent's transcript path, which is what
 `herdlet peek --id <agent> --transcript` reads: the last N assistant messages
@@ -300,13 +304,15 @@ herdlet spawn --agent codex --id personal/herdlet/review --model gpt-5.6-sol --e
 
 `spawn` launches Claude Code by default. Pass `--agent codex` for Codex. Its
 default sandbox is `workspace-write`, and its default approval policy is
-`on-request`. Repeat `--allow "<command prefix>"` to add worker commands to the
+`on-request`. Pass `--agent pi` for pi, with `--provider <name>` and, for a
+read-only worker, `--sandbox read-only` (pi has no sandbox: it launches with
+`--tools read,grep,find,ls`). Repeat `--allow "<command prefix>"` to add worker commands to the
 allowlist in the worker cwd. `spawn` keeps the caller in the left half. It
 stacks workers at equal heights in the right half. A window under 160 columns,
 or a stack below `--min-height 12`, puts the new worker in a new window.
 `--vertical` keeps the old explicit split behavior. The command registers the
 worker as `spawning` and links itself to the worker one way (see "Peer channel").
-It waits for a Claude hook or the Codex input
+It waits for a Claude hook or the Codex / pi input
 prompt, then hands the worker its brief. `--model` and
 `--effort` are required on purpose: a worker is a
 top-level session, so anything you do not pin explicitly runs on your MAIN

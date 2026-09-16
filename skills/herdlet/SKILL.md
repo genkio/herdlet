@@ -31,9 +31,9 @@ registered it but its first hook has not fired yet; `done`
 means its turn finished; `ended` means the whole session exited - the record is
 KEPT (with its session ref) so you can still see it and `resume` it. states
 update automatically via your harness's hooks (`herdlet setup` wires Claude
-Code, Codex, and an opencode plugin), so you normally never report your own
-state; an agent with no integration is tracked manually (`herdlet report`) or by
-its output (`herdlet wait --match`).
+Code, Codex, an opencode plugin and a pi extension), so you normally never
+report your own state; an agent with no integration is tracked manually
+(`herdlet report`) or by its output (`herdlet wait --match`).
 
 **ids**: an agent's id is `$HERDLET_ID` if it was launched with one,
 otherwise its tmux pane id like `%5`. ids come from `herdlet list`; do not
@@ -270,17 +270,19 @@ to hold a conversation. read your peer's actual answer with
 
 ## spawn a worker agent
 
-for a Claude Code or Codex worker, use `herdlet spawn`. one command does the whole
-launch: it builds the pane, pins the model and effort, mutes the human's
+for a Claude Code, Codex or pi worker, use `herdlet spawn`. one command does the
+whole launch: it builds the pane, pins the model and effort, mutes the human's
 per-turn notifications, keeps the pane readable, registers the worker BEFORE its
 first hook, waits for it to come up, and hands it its brief. Claude Code is the
-default agent. pass `--agent codex` for Codex.
+default agent. pass `--agent codex` for Codex, `--agent pi` for pi.
 
 ```bash
 herdlet spawn --id proj/dev --model sonnet --effort medium --brief plans/dev.md
 # spawned proj/dev in %7 (sonnet/medium)
 herdlet spawn --agent codex --id proj/review --model gpt-5.6-sol --effort low --sandbox read-only --brief plans/review.md
 # spawned proj/review in %8 (gpt-5.6-sol/low)
+herdlet spawn --agent pi --id proj/audit --model openai-codex/gpt-5.6-sol --effort low --provider openai-codex --sandbox read-only --brief plans/audit.md
+# spawned proj/audit in %9 (openai-codex/gpt-5.6-sol/low)
 ```
 
 - `--id`, `--model` and `--effort` are required. never let a worker inherit the
@@ -289,11 +291,17 @@ herdlet spawn --agent codex --id proj/review --model gpt-5.6-sol --effort low --
 - `--brief PATH` is the normal way to task a worker: the title defaults to the
   brief's first heading, and once the worker is up it is sent
   `Read <brief> and do it.` write the brief to a file first.
-- `--title "<purpose>"` names a Claude Code session. for Codex, spawn stores the
-  title in the registry message but does not pass it to the launch command.
+- `--title "<purpose>"` names a Claude Code or pi session. for Codex, spawn
+  stores the title in the registry message but does not pass it to the launch
+  command.
 - `--permission-mode <mode>` is for Claude Code only (default `auto`).
   `--sandbox <mode>` and `--approval <on-request|never>` are for Codex only.
   their defaults are `workspace-write` and `on-request`.
+- pi-only flags: `--provider <name>`. `--effort` is passed straight to pi's
+  `--thinking`, so it also takes `off`, `minimal` and `max`. pi has no sandbox
+  and no permission prompts, so spawn refuses `--permission-mode`, `--approval`,
+  `--allow`, and any `--sandbox` but `read-only` - which is not a sandbox either,
+  it just launches pi with `--tools read,grep,find,ls`.
 - repeat `--allow "<command prefix>"` to add commands to the worker's allowlist.
   Claude entries go in `.claude/settings.local.json`. Codex entries go in
   `.codex/rules/herdlet.rules`; Codex loads project rules after it trusts the cwd.
@@ -315,8 +323,8 @@ herdlet spawn --agent codex --id proj/review --model gpt-5.6-sol --effort low --
 - if the window has no room to split, spawn opens a new window in your session
   instead and says so.
 
-`spawn` supports Claude Code and Codex. for any other agent, build the pane by
-hand as below.
+`spawn` supports Claude Code, Codex and pi. for any other agent, build the pane
+by hand as below.
 
 spawn a non-claude worker with the **same launch command you were started
 under**, not a bare vendor binary. that command carries your model routing,
@@ -329,6 +337,7 @@ none of it and may hit the wrong endpoint or an unconfigured model. call it
 | Claude Code | `claude` |
 | Claude Code via a custom endpoint (a wrapper you wrote that sets base url / key / model) | that wrapper |
 | Codex | use `herdlet spawn --agent codex`; no hand-built pane |
+| pi | use `herdlet spawn --agent pi`; no hand-built pane |
 | opencode | `opencode` (the `herdlet setup` plugin reports its state) |
 
 a bare `$LAUNCH -p` pane CLOSES the moment the agent exits, destroying its
@@ -583,7 +592,7 @@ agent as `stale`. do NOT respawn from scratch: a respawned agent redoes all
 of its work, a resumed one continues with its context intact.
 
 ```bash
-herdlet resume --id gtax/impl             # types the native resume command (claude --resume / codex resume / opencode --session)
+herdlet resume --id gtax/impl             # types the native resume command (claude --resume / codex resume / opencode --session / pi --session)
 herdlet resume --id gtax/impl --pane %7   # pane died too: spawn a fresh one, resume there
 ```
 
