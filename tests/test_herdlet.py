@@ -465,6 +465,8 @@ class HerdletTest(unittest.TestCase):
             self.assertIn("--agent codex --event PreCompact",
                           codex["hooks"]["PreCompact"][0]["hooks"][0]["command"])
             self.assertTrue(os.path.exists(
+                os.path.join(home, ".pi", "agent", "extensions", "herdlet.ts")))
+            self.assertTrue(os.path.exists(
                 os.path.join(home, ".claude", "skills", "herdlet", "SKILL.md")))
             self.assertTrue(os.path.exists(
                 os.path.join(home, ".codex", "skills", "herdlet", "SKILL.md")))
@@ -619,6 +621,45 @@ class HerdletTest(unittest.TestCase):
         self.assertEqual(rec["compacts"], 1)
         self.assertEqual(rec["agent"], "codex")
 
+    def test_pi_hook_lifecycle_drives_state_session_and_transcript(self):
+        env = {"HERDLET_ID": "pi1"}
+
+        def pi_hook(event, **extra):
+            payload = {"hook_event_name": event, "session_id": "pi-uuid",
+                       "transcript_path": "/tmp/pi.jsonl", "cwd": "/tmp"}
+            payload.update(extra)
+            self.run_cli("hook", "--agent", "pi", "--event", event,
+                         stdin=json.dumps(payload), env_extra=env)
+
+        pi_hook("SessionStart")
+        rec = self.parse(self.run_cli("get", "--id", "pi1"))["result"]
+        self.assertEqual((rec["state"], rec["agent"]), ("idle", "pi"))
+        self.assertEqual(rec["session"], "pi-uuid")
+        self.assertEqual(rec["transcript"], "/tmp/pi.jsonl")
+
+        pi_hook("UserPromptSubmit", prompt="run ls")
+        rec = self.parse(self.run_cli("get", "--id", "pi1"))["result"]
+        self.assertEqual((rec["state"], rec["message"]), ("working", "run ls"))
+
+        pi_hook("PermissionRequest", message="pick a model")
+        rec = self.parse(self.run_cli("get", "--id", "pi1"))["result"]
+        self.assertEqual((rec["state"], rec["message"]), ("blocked", "pick a model"))
+
+        pi_hook("PreToolUse")
+        self.assertEqual(
+            self.parse(self.run_cli("get", "--id", "pi1"))["result"]["state"],
+            "working")
+
+        pi_hook("Stop")
+        self.assertEqual(
+            self.parse(self.run_cli("get", "--id", "pi1"))["result"]["state"],
+            "done")
+
+        pi_hook("SessionEnd")
+        rec = self.parse(self.run_cli("get", "--id", "pi1"))["result"]
+        self.assertEqual(rec["state"], "ended")
+        self.assertEqual(rec["session"], "pi-uuid")
+
     def test_hook_records_transcript_path(self):
         self.run_cli("hook", stdin=json.dumps(
             {"hook_event_name": "UserPromptSubmit", "prompt": "go",
@@ -711,7 +752,27 @@ class HerdletTest(unittest.TestCase):
         proc = self.run_cli("spawn", "--id", "x/y", "--model", "opus",
                             "--effort", "high", "--agent", "opencode")
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("spawn supports claude and codex only", proc.stderr)
+        self.assertIn("spawn supports claude, codex and pi only", proc.stderr)
+
+    def test_spawn_rejects_pi_only_and_claude_only_flags(self):
+        cases = (
+            (("--agent", "pi", "--allow", "git status"),
+             "pi has no permission prompts"),
+            (("--agent", "pi", "--sandbox", "workspace-write"),
+             "pi has no sandbox"),
+            (("--agent", "pi", "--permission-mode", "auto"),
+             "pi has no permission modes"),
+            (("--agent", "pi", "--approval", "never"),
+             "--approval is only valid with --agent codex"),
+            (("--agent", "codex", "--provider", "openai-codex"),
+             "--provider is only valid with --agent pi"),
+        )
+        for flags, message in cases:
+            with self.subTest(flags=flags):
+                proc = self.run_cli("spawn", "--id", "x/y", "--model", "m",
+                                    "--effort", "low", *flags)
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn(message, proc.stderr)
 
     def test_spawn_rejects_sandbox_for_claude(self):
         proc = self.run_cli("spawn", "--id", "x/y", "--model", "opus",
@@ -1479,6 +1540,76 @@ CODEX_PENDING_PANE = """\
   gpt-5.6-sol low · ~/code/herdlet
 """
 
+PI_EMPTY_PANE = """\
+──────────────────────────────────────────────────────────────────────
+
+──────────────────────────────────────────────────────────────────────
+/private/tmp
+$0.000 (sub) 0.0%/272k (auto)                     (openai-codex) gpt-5.6-sol • medium
+"""
+
+PI_PENDING_PANE = """\
+──────────────────────────────────────────────────────────────────────
+line one
+line two
+
+──────────────────────────────────────────────────────────────────────
+/private/tmp
+$0.000 (sub) 0.0%/272k (auto)                     (openai-codex) gpt-5.6-sol • medium
+"""
+
+# a custom footer extension may replace pi's status line: order, separators and
+# the model block all move, the usage and cost numbers do not
+PI_CUSTOM_FOOTER_PANE = """\
+──────────────────────────────────────────────────────────────────────
+
+──────────────────────────────────────────────────────────────────────
+0.0%/272k · $0.00 · /private/tmp • dev/pi-smoke: pi smoke · (openai-codex) gpt-5.6-sol (low)
+"""
+
+# pi pads the empty box with spaces, and a draft keeps its own indentation
+PI_PADDED_EMPTY_PANE = (
+    "─" * 70 + "\n"
+    + " " * 46 + "\n"
+    + "─" * 70 + "\n"
+    "/private/tmp\n"
+    "$0.000 (sub) 0.0%/272k (auto)                     (openai-codex) gpt-5.6-sol • medium\n")
+
+PI_INDENTED_DRAFT_PANE = (
+    "─" * 70 + "\n"
+    "line one\n"
+    "    line two\n"
+    "\n"
+    + "─" * 70 + "\n"
+    "/private/tmp\n"
+    "$0.000 (sub) 0.0%/272k (auto)                     (openai-codex) gpt-5.6-sol • medium\n")
+
+# a narrow pane truncates the model block away entirely
+PI_NARROW_FOOTER_PANE = """\
+────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────
+0.0%/1m · $0.00 · /private/tmp • dev/pi-ds: pi smoke · (fireworks) accounts/fireworks/mod...
+"""
+
+# the model block and thinking level alone are not a footer
+PI_MODEL_BLOCK_ONLY_PANE = """\
+──────────────────────────────────────────────────────────────────────
+
+──────────────────────────────────────────────────────────────────────
+i ran it with (openai-codex) gpt-5.6-sol • medium
+"""
+
+# a Claude pane whose chat quotes a pi usage token: the marker path must win
+CLAUDE_QUOTING_PI_FOOTER_PANE = """\
+  the worker footer said 0.0%/272k · $0.00 · ~/code/herdlet
+
+───────────────────────────────────────────────────────────────────────────────
+❯ pending claude fixture
+───────────────────────────────────────────────────────────────────────────────
+  haiku-4-5-20251001 (medium) · 0k/200k (0%) · ~/code/herdlet · main
+"""
+
 CODEX_MENU_PANE = """\
   Select Model and Effort
   Access legacy models by running codex -m <model_name> or in your config.tom
@@ -1566,6 +1697,14 @@ class PaneInputTextTest(unittest.TestCase):
             (CODEX_EMPTY_PANE, ""),
             (CODEX_PENDING_PANE, "pending codex fixture"),
             (CODEX_MENU_PANE, None),
+            (PI_EMPTY_PANE, ""),
+            (PI_PENDING_PANE, "line one\nline two"),
+            (PI_CUSTOM_FOOTER_PANE, ""),
+            (PI_NARROW_FOOTER_PANE, ""),
+            (PI_PADDED_EMPTY_PANE, ""),
+            (PI_INDENTED_DRAFT_PANE, "line one\n    line two"),
+            (PI_MODEL_BLOCK_ONLY_PANE, None),
+            (CLAUDE_QUOTING_PI_FOOTER_PANE, "pending claude fixture"),
         )
         for capture, expected in cases:
             with self.subTest(expected=expected):
@@ -1944,6 +2083,34 @@ class SpawnLineTest(unittest.TestCase):
         self.assertFalse(self.h.codex_prompt_ready("› Ask Codex to do\n  anything\n"))
         self.assertFalse(self.h.codex_prompt_ready("› 1. Yes, continue\n2. No, quit"))
 
+    def test_pi_launch_line(self):
+        line = self.h.spawn_line("proj/dev", "openai-codex/gpt-5.6-sol", "low",
+                                 "probe", None, program="pi",
+                                 sandbox="read-only", provider="openai-codex")
+        self.assertEqual(line, (
+            "CC_IMESSAGE_SKIP=1 CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 "
+            "HERDLET_ID=proj/dev pi --name 'proj/dev: probe' "
+            "--model openai-codex/gpt-5.6-sol --thinking low "
+            "--provider openai-codex --tools read,grep,find,ls"))
+
+    def test_pi_launch_line_without_provider_or_sandbox(self):
+        line = self.h.spawn_line("proj/dev", "gpt-5.6-sol", "medium", "probe",
+                                 None, program="pi")
+        self.assertNotIn("--provider", line)
+        self.assertNotIn("--tools", line)
+        self.assertTrue(line.endswith("--thinking medium"))
+
+    def test_pi_prompt_matcher(self):
+        self.assertTrue(self.h.pi_prompt_ready(PI_EMPTY_PANE))
+        self.assertTrue(self.h.pi_prompt_ready(PI_PENDING_PANE))
+        self.assertTrue(self.h.pi_prompt_ready(PI_CUSTOM_FOOTER_PANE))
+        self.assertTrue(self.h.pi_prompt_ready(PI_NARROW_FOOTER_PANE))
+        self.assertFalse(self.h.pi_prompt_ready(PI_MODEL_BLOCK_ONLY_PANE))
+        self.assertFalse(self.h.pi_prompt_ready(CLAUDE_EMPTY_PANE))
+        self.assertFalse(self.h.pi_prompt_ready(CODEX_EMPTY_PANE))
+        # the footer alone is not a prompt: the input box must be drawn too
+        self.assertFalse(self.h.pi_prompt_ready("0.0%/272k · $0.00 · /tmp\n"))
+
     def test_codex_trust_prompt_matcher(self):
         menu = ("Do you trust the contents of this directory?\n\n"
                 "› 1. Yes, continue\n  2. No, quit\n")
@@ -2230,6 +2397,25 @@ class SpawnCommandTest(_DaemonCase):
         self.assertEqual(code, 0)
         self.assertTrue(captures)
         self.assertTrue(all("-J" in args for args in captures))
+
+    def test_pi_registers_and_uses_the_input_box_for_readiness(self):
+        original = self.h.tmux
+
+        def tmux(*args, **kw):
+            if args[0] == "capture-pane":
+                return PI_EMPTY_PANE
+            return original(*args, **kw)
+
+        self.h.tmux = tmux
+        code, out, err = self.spawn(agent="pi", model="openai-codex/gpt-5.6-sol",
+                                    effort="low", permission_mode=None,
+                                    program=None, sandbox="read-only",
+                                    provider="openai-codex")
+        rec = self.record("proj/dev")
+        self.assertEqual(rec["state"], "spawning")
+        self.assertEqual(rec["agent"], "pi")
+        self.assertEqual(err, "")
+        self.assertEqual(code, 0)
 
     def test_ready_worker_gets_its_brief_with_an_absolute_path(self):
         brief = os.path.join(self.tmp.name, "b.md")
@@ -2700,6 +2886,24 @@ class TranscriptParseTest(unittest.TestCase):
         )) + "\n")
         self.assertEqual(self.h.transcript_messages(path, 5),
                          [("t1", "one\ntwo"), ("t3", "three"), ("t4", "four")])
+
+    def test_pi_messages_keep_text_blocks_only(self):
+        path = self.write("\n".join((
+            json.dumps({"type": "session", "id": "uuid-1"}),
+            json.dumps({"type": "message", "timestamp": "t1", "message": {
+                "role": "user", "content": [{"type": "text", "text": "ask"}]}}),
+            json.dumps({"type": "message", "timestamp": "t2", "message": {
+                "role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "secret"},
+                    {"type": "toolCall", "name": "bash"},
+                    {"type": "text", "text": "one"},
+                    {"type": "text", "text": "two"}]}}),
+            json.dumps({"type": "message", "timestamp": "t3", "message": {
+                "role": "assistant", "content": [
+                    {"type": "toolCall", "name": "read"}]}}),
+        )) + "\n")
+        self.assertEqual(self.h.transcript_messages(path, 5),
+                         [("t2", "one\ntwo")])
 
     def test_mixed_formats_and_garbage_lines_survive(self):
         path = self.write(
