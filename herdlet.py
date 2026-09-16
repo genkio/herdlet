@@ -92,6 +92,7 @@ RESUME = {
     "claude": "claude --resume {session}",
     "codex": "codex resume {session}",
     "opencode": "opencode --session {session}",
+    "pi": "pi --session {session}",
 }
 
 
@@ -1276,6 +1277,28 @@ def _opencode_plugin_source():
     return None
 
 
+def _pi_extension_source():
+    here = os.path.dirname(os.path.realpath(__file__))
+    for cand in (os.path.join(here, "integrations", "pi", "herdlet.ts"),
+                 os.path.normpath(os.path.join(here, "..", "share", "doc",
+                                               "herdlet", "pi-herdlet.ts"))):
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+def _install_pi_extension():
+    dest = os.path.expanduser("~/.pi/agent/extensions/herdlet.ts")
+    if os.path.lexists(dest):
+        return f"{dest}: already present, skipped"
+    source = _pi_extension_source()
+    if source is None:
+        return "pi extension not found next to this install, skipped"
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.copyfile(source, dest)
+    return f"{dest}: installed"
+
+
 def _install_opencode_plugin():
     # opencode auto-loads any *.js/*.ts in its global plugins dir. Unlike Claude
     # and Codex it has no shell-hook config, so the bridge is a plugin file.
@@ -1315,6 +1338,7 @@ def cmd_setup(args):
     print(f"codex hooks  : {'wired ' + ', '.join(added) if added else 'already wired'}")
 
     print(f"opencode plug: {_install_opencode_plugin()}")
+    print(f"pi extension : {_install_pi_extension()}")
 
     print(f"claude skill : {_install_skill(os.path.join(home, '.claude', 'skills'))}")
     print(f"codex skill  : {_install_skill(os.path.join(home, '.codex', 'skills'))}")
@@ -1766,6 +1790,19 @@ def codex_transcript_message(row):
     return None
 
 
+def pi_transcript_message(row):
+    message = row.get("message")
+    if row.get("type") != "message" or not isinstance(message, dict):
+        return None
+    if message.get("role") != "assistant":
+        return None
+    text = "\n".join(
+        block.get("text") or "" for block in message.get("content") or []
+        if isinstance(block, dict) and block.get("type") == "text"
+    ).strip()
+    return text or None
+
+
 def transcript_messages(path, count):
     """Last `count` (timestamp, text) assistant messages of a jsonl, oldest first."""
     found = []
@@ -1787,6 +1824,10 @@ def transcript_messages(path, count):
                     continue
                 codex_sources[text] = source
                 found.append((row.get("timestamp"), text))
+                continue
+            pi_text = pi_transcript_message(row)
+            if pi_text:
+                found.append((row.get("timestamp"), pi_text))
                 continue
             if row.get("type") != "assistant":
                 continue
@@ -2632,7 +2673,7 @@ def main():
     p.add_argument("--id", help="agent id (default: $HERDLET_ID or $TMUX_PANE)")
     p.add_argument("--state", required=True, help=f"one of {'/'.join(STATES)} or custom")
     p.add_argument("--message", help="what the agent is doing ('' clears)")
-    p.add_argument("--agent", help="agent kind, e.g. claude / codex")
+    p.add_argument("--agent", help="agent kind, e.g. claude / codex / pi")
     p.add_argument("--pane", help="tmux pane id (default: $TMUX_PANE)")
     p.add_argument("--cwd", help="working directory")
     p.add_argument("--session", help="agent's native session ref (enables resume)")
@@ -2692,8 +2733,8 @@ def main():
     p.add_argument("--state")
     p.set_defaults(fn=cmd_watch)
 
-    p = sub.add_parser("hook", help="adapter for Claude Code / Codex hooks (reads stdin JSON)")
-    p.add_argument("--agent", default="claude", help="claude / codex (default: claude)")
+    p = sub.add_parser("hook", help="adapter for Claude Code / Codex / pi hooks (reads stdin JSON)")
+    p.add_argument("--agent", default="claude", help="claude / codex / pi (default: claude)")
     p.add_argument("--event", help="override hook_event_name")
     p.add_argument("--id", help="override agent id")
     p.set_defaults(fn=cmd_hook)
