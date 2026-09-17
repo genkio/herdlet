@@ -2151,6 +2151,8 @@ def cmd_spawn(args):
             "launch other agents by hand (see README)")
     if args.min_height < 1:
         die("--min-height must be one or more")
+    if args.stack and args.vertical:
+        die("--stack and --vertical are exclusive; pick one placement")
     sandbox = getattr(args, "sandbox", None)
     approval = getattr(args, "approval", None)
     permission_mode = getattr(args, "permission_mode", None)
@@ -2187,30 +2189,35 @@ def cmd_spawn(args):
                       args.program_args or (), sandbox, approval, provider)
 
     fallback = None
-    placement = "vertical" if args.vertical else "right-stack"
-    pane_output = tmux("list-panes", "-t", caller, "-F", SPAWN_PANE_FORMAT,
-                       check=True) or ""
-    target = spawn_target(caller, spawn_panes(pane_output), args.min_height,
-                          args.vertical)
     out = None
-    if target is not None:
-        target_pane, direction, size = target
-        out = tmux_run(*spawn_split_argv(target_pane, cwd, line, direction, size),
-                       timeout=15)
-        if out is None:
-            die("tmux not available")
-        if out.returncode != 0 and "no space" not in out.stderr.lower():
-            die(f"tmux split-window: {out.stderr.strip()}")
-    if target is None or out.returncode != 0:
+    placement = ("vertical" if args.vertical
+                 else "right-stack" if args.stack else "new-window")
+    if placement != "new-window":
+        pane_output = tmux("list-panes", "-t", caller, "-F", SPAWN_PANE_FORMAT,
+                           check=True) or ""
+        target = spawn_target(caller, spawn_panes(pane_output), args.min_height,
+                              args.vertical)
+        if target is not None:
+            target_pane, direction, size = target
+            out = tmux_run(*spawn_split_argv(target_pane, cwd, line, direction,
+                                             size), timeout=15)
+            if out is None:
+                die("tmux not available")
+            if out.returncode != 0 and "no space" not in out.stderr.lower():
+                die(f"tmux split-window: {out.stderr.strip()}")
+        if target is None or out.returncode != 0:
+            placement = "new-window"
+            fallback = "window full"
+    if placement == "new-window":
         session = (tmux("display-message", "-p", "-t", caller,
                         "#{session_name}", check=True) or "").strip()
-        fallback = f"window full, opened a new window in session {session}"
-        placement = "new-window"
+        if fallback:
+            fallback = f"window full, opened a new window in session {session}"
         out = tmux_run(*spawn_window_argv(session, args.id, cwd, line), timeout=15)
         if out is None or out.returncode != 0:
             die(f"tmux new-window: {(out.stderr if out else '').strip()}")
     pane = out.stdout.strip()
-    if placement == "right-stack" and not args.vertical:
+    if placement == "right-stack":
         balance_right_stack(caller)
 
     # register before the worker's first hook: until then it has no record at
@@ -2847,8 +2854,12 @@ def main():
     p.add_argument("--env", action="append", metavar="K=V",
                    help="extra env var for the worker (repeatable)")
     p.add_argument("--vertical", action="store_true", help="split vertically")
+    p.add_argument("--stack", action="store_true",
+                   help="split into the caller's right-hand stack instead of "
+                        "opening a new window")
     p.add_argument("--min-height", type=int, default=12,
-                   help="minimum rows per right-stack worker (default: 12)")
+                   help="minimum rows per right-stack worker with --stack "
+                        "(default: 12)")
     p.add_argument("--ready-timeout", type=float, default=30,
                    help="seconds to wait for worker readiness (default: 30)")
     p.add_argument("--json", action="store_true")
