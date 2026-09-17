@@ -139,6 +139,18 @@ Pass `--force` to override this guard.
 Agent ids resolve from `--id`, then `$HERDLET_ID`, then `$TMUX_PANE`. Name an
 agent by launching it with an env var: `HERDLET_ID=builder claude`.
 
+A Claude Code session binds its own message socket and tells its hooks about it,
+so `herdlet hook` records that socket and its token in the agent's record. When
+the record has one, `send` hands the message to the session directly and reads
+no pane: the session takes it between tool calls when it is busy, or starts a
+turn when it is idle. `send` writes `delivered via socket` on stderr, and
+`--json` carries `"via": "socket"`. Without a recorded socket, or when the
+socket is gone or refuses the connection, `send` types into the pane as before
+and says `typed into pane`. The `--no-enter` flag always types, because a
+socket delivery cannot leave a draft. The token is not printed: `get`, `list`,
+`wait` and `watch` show the socket path only, because a token authorizes
+writing to that session and only `send` needs it.
+
 `send` serializes messages for each target pane. It waits up to five seconds for
 existing input to clear before it types. If the input stays, it exits 4 and types
 nothing. If no input box is visible, it exits 6 and shows the pane tail - except
