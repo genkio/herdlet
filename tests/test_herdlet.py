@@ -2540,6 +2540,7 @@ class SpawnCommandTest(_DaemonCase):
         self.h.send_text = lambda pane, text, no_enter=False: self.sent.append((pane, text))
         self.panes = {"%0", "%7"}
         self.did_split = False
+        self.layout = None
         self.h.tmux = self._tmux
         self.h.tmux_run = self._tmux_run
 
@@ -2554,8 +2555,12 @@ class SpawnCommandTest(_DaemonCase):
             self.did_split = result.returncode == 0
             return result
         if args[0] == "new-window":
-            return subprocess.CompletedProcess(args, 0, "%9\n", "")
+            # same pane id as a split, so a test tells the two apart by the
+            # tmux command it sees, not by the pane it got back
+            return subprocess.CompletedProcess(args, 0, "%7\n", "")
         if args[0] == "list-panes":
+            if self.layout is not None:
+                return subprocess.CompletedProcess(args, 0, self.layout, "")
             output = "%0\t0\t0\t180\t40\t180\n"
             if self.did_split:
                 output = ("%0\t0\t0\t90\t40\t180\n"
@@ -2576,7 +2581,7 @@ class SpawnCommandTest(_DaemonCase):
     def args(self, **kw):
         base = dict(socket=self.sock, id="proj/dev", model="opus", effort="high",
                     agent="claude", title=None, brief=None, cwd=None,
-                    permission_mode="auto", env=None, vertical=False,
+                    permission_mode="auto", env=None, vertical=False, stack=False,
                     ready_timeout=0.5, json=False, program="claude",
                     program_args=None, sandbox=None, approval=None, allow=None,
                     min_height=12)
@@ -2697,12 +2702,11 @@ class SpawnCommandTest(_DaemonCase):
     def test_no_space_falls_back_to_a_new_window(self):
         self.split_result = lambda: subprocess.CompletedProcess(
             (), 1, "", "no space for new pane")
-        self.panes.add("%9")
-        code, out, err = self.spawn()
+        code, out, err = self.spawn(stack=True)
         self.assertIn("new-window", [r[0] for r in self.runs])
-        self.assertEqual(self.record("proj/dev")["pane"], "%9")
+        self.assertEqual(self.record("proj/dev")["pane"], "%7")
         self.assertIn("window full, opened a new window in session work", out)
-        self.assertIn("spawned proj/dev in %9 (opus/high)", out)
+        self.assertIn("spawned proj/dev in %7 (opus/high)", out)
         self.assertEqual(code, 0)
 
     def test_timeout_with_a_live_pane_is_not_a_failure(self):
@@ -2808,7 +2812,7 @@ class SpawnCommandTest(_DaemonCase):
             "type": "spawned", "id": "proj/dev", "pane": "%7", "model": "opus",
             "effort": "high", "title": "Do the thing", "cwd": os.getcwd(),
             "ready": True, "brief_sent": True, "note": None,
-            "placement": "right-stack"})
+            "placement": "new-window"})
         self.assertEqual(code, 0)
 
     def test_json_payload_reports_a_withheld_brief(self):
@@ -2827,6 +2831,46 @@ class SpawnCommandTest(_DaemonCase):
         splits = [args for args in self.runs if args[0] == "split-window"]
         self.assertIn("-v", splits[0])
         self.assertEqual(code, 0)
+
+    def test_a_bare_spawn_opens_a_window_named_for_the_agent(self):
+        self.ready_in(0.15)
+        code, out, err = self.spawn(json=True, ready_timeout=3)
+        payload = json.loads(out)["result"]
+        self.assertEqual(payload["placement"], "new-window")
+        self.assertIsNone(payload["note"])   # chosen, not a fallback
+        windows = [args for args in self.runs if args[0] == "new-window"]
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(windows[0][windows[0].index("-n") + 1], "proj/dev")
+        self.assertEqual(windows[0][windows[0].index("-t") + 1], "work")
+        self.assertNotIn("split-window", [args[0] for args in self.runs])
+        self.assertEqual(code, 0)
+
+    def test_stack_reproduces_the_right_stack_split(self):
+        self.ready_in(0.15)
+        code, out, err = self.spawn(stack=True, json=True, ready_timeout=3)
+        self.assertEqual(json.loads(out)["result"]["placement"], "right-stack")
+        splits = [args for args in self.runs if args[0] == "split-window"]
+        self.assertEqual(len(splits), 1)
+        self.assertIn("-h", splits[0])
+        self.assertNotIn("new-window", [args[0] for args in self.runs])
+        self.assertEqual(code, 0)
+
+    def test_stack_in_a_narrow_window_still_falls_back(self):
+        self.layout = "%0\t0\t0\t120\t40\t120\n"
+        code, out, err = self.spawn(stack=True, json=True)
+        payload = json.loads(out)["result"]
+        self.assertEqual(payload["placement"], "new-window")
+        self.assertEqual(payload["note"],
+                         "window full, opened a new window in session work")
+        self.assertNotIn("split-window", [args[0] for args in self.runs])
+        self.assertEqual(code, 0)
+
+    def test_stack_and_vertical_together_are_refused(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            self.h.cmd_spawn(self.args(stack=True, vertical=True))
+        self.assertIn("--stack and --vertical are exclusive", err.getvalue())
+        self.assertEqual(self.runs, [])
 
 
 class ApproveTimeoutTest(_DaemonCase):
