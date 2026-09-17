@@ -8,7 +8,7 @@ description: "Coordinate with other coding agents running in tmux panes. See who
 before using this skill, check that you are inside tmux (`$TMUX_PANE` is set)
 and `herdlet` is on PATH. if either is missing, say so and stop.
 
-you are one of possibly several coding agents, each in its own tmux pane.
+you are one of possibly several coding agents, each in its own tmux window.
 herdlet is a small coordination bus: every agent has an id, a semantic state,
 and a registered pane. tmux does the terminal work; herdlet tells you who is
 doing what, and lets you wait on other agents instead of polling their panes.
@@ -44,9 +44,9 @@ project uses it, and the newer registration silently steals the id.
 
 **your own id**: `$HERDLET_ID` if set, else `$TMUX_PANE`.
 
-**layout convention**: one tmux session per domain (work, personal), one
-window per project, one pane per role. stay inside your own session and your
-own id prefix unless explicitly asked to reach further.
+**layout convention**: one tmux session per orchestrated run, one window per
+agent, named for its id. the orchestrator holds window 0. stay inside your own
+session and your own id prefix unless explicitly asked to reach further.
 
 ## discover the herd
 
@@ -305,7 +305,10 @@ herdlet spawn --agent pi --id proj/audit --model openai-codex/gpt-5.6-sol --effo
 - repeat `--allow "<command prefix>"` to add commands to the worker's allowlist.
   Claude entries go in `.claude/settings.local.json`. Codex entries go in
   `.codex/rules/herdlet.rules`; Codex loads project rules after it trusts the cwd.
-- other flags: `--cwd DIR`, `--vertical`, `--env K=V` (repeatable),
+- placement flags: `--stack` splits the caller's window into the right-hand
+  stack, `--vertical` splits the caller's pane. the two together are refused.
+  `--min-height ROWS` (default 12) applies to `--stack` only.
+- other flags: `--cwd DIR`, `--env K=V` (repeatable),
   `--ready-timeout SECONDS` (default 30), `--json`.
 - exit 0 = the pane is up. either the worker registered and got its brief, or it
   had not reported within `--ready-timeout` but its pane is alive. in the second
@@ -380,14 +383,16 @@ tmux split-window -d -P -F '#{pane_id}' -t "$TMUX_PANE" \
 **always pass `-t "$TMUX_PANE"`.** without a target, `split-window` splits
 the window the human is LOOKING AT right now, not yours - if they switched to
 another project's window while you worked, your worker lands in that window
-and they lose track of it. `-t "$TMUX_PANE"` splits your own pane, wherever
-the human's focus is. (`herdlet spawn` does this for you.)
+and they lose track of it. `-t "$TMUX_PANE"` anchors the command to your own
+pane, wherever the human's focus is. (`herdlet spawn` does this for you, and
+its own default opens a new window, which never disturbs their focus either.)
 
-`herdlet spawn` keeps the master in the left half and stacks workers in the
-right half. it gives the right workers equal heights. a window under 160
-columns or a stack below `--min-height 12` puts the worker in a new window.
-pass `--vertical` to use the old explicit vertical split.
-spawn JSON reports `placement` as `right-stack`, `new-window`, or `vertical`.
+`herdlet spawn` gives each worker its own window, named for the agent id. pass
+`--stack` to keep the master in the left half and stack workers in the right
+half with equal heights; under `--stack` a window below 160 columns or a stack
+below `--min-height 12` falls back to a new window. pass `--vertical` for an
+explicit vertical split of the caller's pane.
+spawn JSON reports `placement` as `new-window`, `right-stack`, or `vertical`.
 
 after they register you drive them with `send` / `wait` / `peek` cycles.
 
@@ -466,11 +471,10 @@ hook-driven, not scraped - this only restores your ability to READ the pane.
 ## act as a master orchestrator
 
 if the user asks you to manage a project (or several), you are the master:
-a long-lived agent in window 0 of a domain session. per project, create one
-window with one pane per role, then relay work between them:
+a long-lived agent in window 0 of the run's session. spawn one worker per role;
+each gets its own window, named for its id. then relay work between them:
 
 ```bash
-tmux new-window -t personal -n herdlet -c ~/code/herdlet
 herdlet spawn --id personal/herdlet/dev    --model <mid-id>   --effort medium --brief plans/dev.md
 herdlet spawn --id personal/herdlet/tester --model <cheap-id> --effort low    --brief plans/tester.md
 ```

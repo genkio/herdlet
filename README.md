@@ -282,25 +282,22 @@ agent's pane, `q` to quit. Wire it to a tmux popup:
 bind m display-popup -E -w 80% -h 60% -T " agents " "herdlet monitor"
 ```
 
-## Layout: sessions are domains, windows are projects, panes are roles
+## Layout: sessions are domains, windows are agents
 
 herdlet's namespace is global (one bus per machine), so structure comes from
 two conventions, not infrastructure:
 
 ```
-session "work"                      session "personal"
-├── window 0: master  <- you        ├── window 0: master  <- you
-├── window 1: billing-api           ├── window 1: herdlet
-│   ├── work/billing/planner       │   ├── personal/herdlet/dev
-│   ├── work/billing/dev           │   └── personal/herdlet/tester
-│   └── work/billing/tester        └── window 2: genkia
-└── window 2: admin-ui                  └── personal/genkia/dev
+session "work"                           session "personal"
+├── window 0: master  <- you             ├── window 0: master  <- you
+├── window work/billing/planner          ├── window personal/herdlet/dev
+├── window work/billing/dev              ├── window personal/herdlet/tester
+└── window work/billing/tester           └── window personal/genkia/dev
 ```
 
 - **One tmux session per domain** (work, personal, ...). Each domain gets a
   long-lived **master**: an interactive agent in window 0 that you talk to.
-- **One window per project**, **one pane per role**, spawned by the master on
-  demand.
+- **One window per agent**, named for its id, spawned by the master on demand.
 - **Name agents `project/role`** via `HERDLET_ID`. Names are the only thing
   that can collide across projects; the prefix makes them unique, and
   `herdlet list --prefix herdlet/` or `--here` keeps discovery scoped.
@@ -320,11 +317,13 @@ default sandbox is `workspace-write`, and its default approval policy is
 `on-request`. Pass `--agent pi` for pi, with `--provider <name>` and, for a
 read-only worker, `--sandbox read-only` (pi has no sandbox: it launches with
 `--tools read,grep,find,ls`). Repeat `--allow "<command prefix>"` to add worker commands to the
-allowlist in the worker cwd. `spawn` keeps the caller in the left half. It
-stacks workers at equal heights in the right half. A window under 160 columns,
-or a stack below `--min-height 12`, puts the new worker in a new window.
-`--vertical` keeps the old explicit split behavior. The command registers the
-worker as `spawning` and links itself to the worker one way (see "Peer channel").
+allowlist in the worker cwd. `spawn` gives each worker its own window, named
+for its id. `--stack` keeps the caller in the left half and stacks workers at
+equal heights in the right half; under `--stack` a window under 160 columns, or
+a stack below `--min-height 12`, falls back to a new window. `--vertical` keeps
+the explicit split of the caller's pane. The two flags are exclusive.
+The command registers the worker as `spawning` and links itself to the worker
+one way (see "Peer channel").
 It waits for a Claude hook or the Codex / pi input
 prompt, then hands the worker its brief. `--model` and
 `--effort` are required on purpose: a worker is a
@@ -333,7 +332,7 @@ top-level session, so anything you do not pin explicitly runs on your MAIN
 wrapper that sets a custom endpoint) still launch by hand with
 `tmux split-window`; see the skill for that recipe.
 
-Spawn JSON reports `placement` as `right-stack`, `new-window`, or `vertical`.
+Spawn JSON reports `placement` as `new-window`, `right-stack`, or `vertical`.
 
 For Codex, `--sandbox danger-full-access --approval never` is the equivalent
 of Claude's `bypassPermissions`. It gives the worker no prompts and no sandbox.
