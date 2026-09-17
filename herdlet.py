@@ -44,7 +44,7 @@ LOG_PATH = os.path.expanduser("~/.herdlet.log")
 STATES = ("idle", "working", "spawning", "blocked", "limited", "done", "ended", "unknown")
 TERMINAL = ("done", "ended")  # agent's turn/session finished; record kept for collection + resume
 MERGE_KEYS = ("message", "agent", "pane", "cwd", "session", "transcript",
-              "model", "effort", "tmux")
+              "model", "effort", "tmux", "inbox", "inbox_token")
 SHELLS = {"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "nu"}
 # A pane sitting at a shell only means the agent DIED if it also stopped
 # reporting. A live agent (wrapper script, `claude -p` piped to tee, a shell
@@ -152,14 +152,20 @@ class Bus:
         except OSError:
             pass  # persistence is best-effort; the live bus is the truth
 
-    def snapshot(self, agent_id):
+    def snapshot(self, agent_id, secrets=False):
         rec = self.agents.get(agent_id)
         # compacts/peers/instance defaulted here so a record written by an
         # older daemon still answers the questions `get` is asked
         if not rec:
             return None
-        return {"id": agent_id, "compacts": 0, "peers": [], "topics": {},
+        snap = {"id": agent_id, "compacts": 0, "peers": [], "topics": {},
                 "instance": 0, **rec}
+        if not secrets:
+            # a session's inbox token authorizes writing to that session; only
+            # `send` needs it, and it asks. Everything else - get, list, watch,
+            # every event - would otherwise copy it into panes and report files
+            snap.pop("inbox_token", None)
+        return snap
 
     def _next_instance(self):
         self._instance += 1
@@ -178,6 +184,7 @@ class Bus:
         if rec is None:
             rec = {"state": "unknown", "message": None, "agent": None,
                    "pane": None, "cwd": None, "session": None, "transcript": None,
+                   "inbox": None, "inbox_token": None,
                    "model": None, "effort": None, "compacts": 0,
                    "peers": [], "topics": {}, "updated": 0.0,
                    "instance": self._next_instance()}
@@ -456,7 +463,7 @@ async def _handle_client(reader, writer, bus):
                 _send(writer, {"id": rid, "result": {**event, "type": "reported"}})
 
             elif method == "agent.get":
-                snap = bus.snapshot(params.get("id"))
+                snap = bus.snapshot(params.get("id"), params.get("secrets"))
                 if snap is None:
                     _send(writer, {"id": rid, "error": {"code": "not_found"}})
                 else:
@@ -1434,6 +1441,14 @@ def cmd_hook(args):
             params["session"] = squash(str(data["session_id"]), 200)
         if data.get("transcript_path"):
             params["transcript"] = squash(str(data["transcript_path"]), 500)
+        # the hook runs inside the agent's own environment, so a Claude session
+        # hands over its private inbox here and nowhere else; `send` then talks
+        # to the session instead of typing at its pane
+        if os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET"):
+            params["inbox"] = squash(os.environ["CLAUDE_CODE_MESSAGING_SOCKET"], 500)
+        if os.environ.get("CLAUDE_CODE_MESSAGING_TOKEN"):
+            params["inbox_token"] = squash(
+                os.environ["CLAUDE_CODE_MESSAGING_TOKEN"], 500)
         # message: prompt/notification text is worth showing; tool events pass
         # None so the daemon preserves the prompt across the whole turn
         if event == "UserPromptSubmit":
@@ -1655,8 +1670,10 @@ def record_peer_send(sock_path, from_id, to_id, topic, text):
 
 
 def send_record(sock_path, agent_id):
+    # the only caller that needs the inbox token: it is what `send` writes with
     try:
-        return call(sock_path, "agent.get", {"id": agent_id}).get("result")
+        return call(sock_path, "agent.get",
+                    {"id": agent_id, "secrets": True}).get("result")
     except OSError:
         return None
 
@@ -1674,6 +1691,31 @@ def wait_for_send_ack(sock_path, agent_id, text, updated, settle):
         if remaining <= 0:
             return False
         time.sleep(min(SEND_POLL_INTERVAL, remaining))
+
+
+INBOX_TIMEOUT = 2.0
+
+
+def inbox_deliver(path, token, text):
+    """Hand a message to a Claude session over its own socket. True when it took it.
+
+    Two newline-delimited frames, auth first. The session decides delivery for
+    itself - queued mid-turn, a new turn when idle - so no pane is read and no
+    keystroke is guessed at. Any failure is a False: the caller types instead.
+    """
+    if not path or not token:
+        return False
+    frames = [{"type": "auth", "token": token},
+              {"type": "user", "message": {"role": "user", "content": text}}]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(INBOX_TIMEOUT)
+            conn.connect(path)
+            for frame in frames:
+                conn.sendall((json.dumps(frame) + "\n").encode())
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def cmd_send(args):
@@ -1704,21 +1746,34 @@ def cmd_send(args):
         pane, server = resolve_target(args.socket, args.id)
     else:
         pane, server = record.get("pane"), record.get("tmux")
-    if not pane:
+    # --no-enter asks for an unsubmitted draft, which a socket cannot express
+    inbox = None if args.no_enter else (record or {}).get("inbox")
+    if not pane and not inbox:
         die(f"'{args.id}' has no pane")
-    lock = send_lock(args.socket, pane, server)
+    lock = send_lock(args.socket, pane or args.id, server)
     acknowledged = None
+    via = "pane"
     try:
-        if args.no_verify:
+        def baseline():
+            nonlocal record
+            if args.ack:
+                record = send_record(args.socket, args.id)
+
+        if inbox:
+            token = record.get("inbox_token")
+            baseline()
+            if inbox_deliver(inbox, token, text):
+                via = "socket"
+                verified = True
+        if via == "pane" and not pane:
+            die(f"'{args.id}' has no pane")
+        if via == "socket":
+            pass
+        elif args.no_verify:
             send_text(pane, text, args.no_enter, server) if server else \
                 send_text(pane, text, args.no_enter)
             verified = False
         else:
-            def baseline():
-                nonlocal record
-                if args.ack:
-                    record = send_record(args.socket, args.id)
-
             if server:
                 result = verified_send(pane, text, args.settle, baseline, server)
             else:
@@ -1748,6 +1803,8 @@ def cmd_send(args):
                 print(f"herdlet: send to {args.id} not submitted; "
                       "text is sitting in its prompt", file=sys.stderr)
                 return EXIT_SEND
+        print(f"herdlet: {'delivered via socket' if via == 'socket' else 'typed into pane'}",
+              file=sys.stderr)
         if args.ack:
             if record is None:
                 print(f"herdlet: send to {args.id} has no hook record; "
@@ -1766,7 +1823,7 @@ def cmd_send(args):
         lock.close()
     if args.json:
         print(json.dumps({"result": {
-            "type": "sent", "id": args.id, "pane": pane,
+            "type": "sent", "id": args.id, "pane": pane, "via": via,
             "verified": verified, "acknowledged": acknowledged,
         }}, indent=2))
     return 0
