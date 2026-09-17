@@ -45,6 +45,10 @@ class HerdletTest(unittest.TestCase):
         env = dict(os.environ)
         env.pop("TMUX_PANE", None)
         env.pop("HERDLET_ID", None)
+        # the suite itself often runs inside a Claude session, whose own inbox
+        # variables the hook would otherwise record for every test agent
+        env.pop("CLAUDE_CODE_MESSAGING_SOCKET", None)
+        env.pop("CLAUDE_CODE_MESSAGING_TOKEN", None)
         if env_extra:
             env.update(env_extra)
         return subprocess.run(
@@ -667,6 +671,71 @@ class HerdletTest(unittest.TestCase):
             env_extra={"HERDLET_ID": "tr1"})
         rec = self.parse(self.run_cli("get", "--id", "tr1"))["result"]
         self.assertEqual(rec["transcript"], "/tmp/does-not-matter.jsonl")
+
+    def test_hook_records_the_session_inbox(self):
+        env = {"HERDLET_ID": "ib1",
+               "CLAUDE_CODE_MESSAGING_SOCKET": "/tmp/cc-socks/93903.sock",
+               "CLAUDE_CODE_MESSAGING_TOKEN": "tok-93903"}
+        self.run_cli("hook", stdin=json.dumps(
+            {"hook_event_name": "SessionStart"}), env_extra=env)
+        rec = _load_module().send_record(self.sock, "ib1")
+        self.assertEqual(rec["inbox"], "/tmp/cc-socks/93903.sock")
+        self.assertEqual(rec["inbox_token"], "tok-93903")
+
+    def test_hook_keeps_the_inbox_when_an_event_carries_none(self):
+        env = {"HERDLET_ID": "ib2",
+               "CLAUDE_CODE_MESSAGING_SOCKET": "/tmp/cc-socks/2.sock",
+               "CLAUDE_CODE_MESSAGING_TOKEN": "tok-2"}
+        self.run_cli("hook", stdin=json.dumps(
+            {"hook_event_name": "SessionStart"}), env_extra=env)
+        # a hook fired without the variables must preserve, not clear
+        self.run_cli("hook", stdin=json.dumps(
+            {"hook_event_name": "Stop"}), env_extra={"HERDLET_ID": "ib2"})
+        rec = _load_module().send_record(self.sock, "ib2")
+        self.assertEqual(rec["inbox"], "/tmp/cc-socks/2.sock")
+        self.assertEqual(rec["inbox_token"], "tok-2")
+
+    def test_the_inbox_token_is_not_printed_by_the_read_commands(self):
+        # the token authorizes writing to that session; only `send` asks for it
+        env = {"HERDLET_ID": "ib4",
+               "CLAUDE_CODE_MESSAGING_SOCKET": "/tmp/cc-socks/4.sock",
+               "CLAUDE_CODE_MESSAGING_TOKEN": "tok-secret-4"}
+        self.run_cli("hook", stdin=json.dumps(
+            {"hook_event_name": "SessionStart"}), env_extra=env)
+
+        rec = self.parse(self.run_cli("get", "--id", "ib4"))["result"]
+        self.assertEqual(rec["inbox"], "/tmp/cc-socks/4.sock")
+        self.assertNotIn("inbox_token", rec)
+
+        listing = self.run_cli("list", "--json").stdout
+        self.assertIn("/tmp/cc-socks/4.sock", listing)
+        self.assertNotIn("tok-secret-4", listing)
+
+        reported = self.parse(self.run_cli(
+            "report", "--id", "ib4", "--state", "working"))["result"]
+        self.assertNotIn("inbox_token", reported)
+
+        waited = self.parse(self.run_cli(
+            "wait", "--id", "ib4", "--state", "working", "--timeout", "2"))
+        self.assertNotIn("tok-secret-4", json.dumps(waited))
+
+    def test_send_asks_for_the_token_and_gets_it(self):
+        env = {"HERDLET_ID": "ib5",
+               "CLAUDE_CODE_MESSAGING_SOCKET": "/tmp/cc-socks/5.sock",
+               "CLAUDE_CODE_MESSAGING_TOKEN": "tok-secret-5"}
+        self.run_cli("hook", stdin=json.dumps(
+            {"hook_event_name": "SessionStart"}), env_extra=env)
+        h = _load_module()
+        self.assertEqual(h.send_record(self.sock, "ib5")["inbox_token"],
+                         "tok-secret-5")
+
+    def test_hook_records_no_inbox_for_a_session_without_one(self):
+        self.run_cli("hook", stdin=json.dumps(
+            {"hook_event_name": "SessionStart"}),
+            env_extra={"HERDLET_ID": "ib3"})
+        rec = self.parse(self.run_cli("get", "--id", "ib3"))["result"]
+        self.assertIsNone(rec.get("inbox"))
+        self.assertIsNone(rec.get("inbox_token"))
 
     def test_peek_transcript_prints_assistant_text(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1887,6 +1956,8 @@ class SendCommandTest(unittest.TestCase):
         self.h.resolve_target = lambda socket, agent_id: ("%4", None)
         self.h.peer_scope = lambda socket, agent_id: (None, None)
         self.h.pane_is_shell = lambda pane, server=None: False
+        self.h.inbox_deliver = lambda path, token, text: self.fail(
+            "inbox_deliver called without a recorded inbox")
 
     def args(self, **kw):
         base = dict(socket=os.path.join(self.tmp.name, "h.sock"), id="%4",
@@ -1996,7 +2067,7 @@ class SendCommandTest(unittest.TestCase):
             code = self.h.cmd_send(self.args(ack=True, json=True))
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out.getvalue())["result"], {
-            "type": "sent", "id": "%4", "pane": "%4",
+            "type": "sent", "id": "%4", "pane": "%4", "via": "pane",
             "verified": True, "acknowledged": True})
 
     def test_concurrent_identical_sends_use_their_own_ack_baselines(self):
@@ -2034,6 +2105,165 @@ class SendCommandTest(unittest.TestCase):
         second.join(2)
         self.assertEqual(results, [0, 0])
         self.assertEqual(baselines, [10, 20])
+
+
+    def inbox_record(self, **kw):
+        rec = {"pane": "%4", "updated": 10, "inbox": "/tmp/cc-socks/9.sock",
+               "inbox_token": "tok-9"}
+        rec.update(kw)
+        return rec
+
+    def test_a_recorded_inbox_is_used_and_no_pane_is_read(self):
+        self.record = self.inbox_record()
+        delivered = []
+        self.h.inbox_deliver = lambda path, token, text: delivered.append(
+            (path, token, text)) or True
+        self.h.verified_send = lambda *a: self.fail("typed despite a live inbox")
+        self.h.send_text = lambda *a, **kw: self.fail("typed despite a live inbox")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = self.h.cmd_send(self.args())
+        self.assertEqual(code, 0)
+        self.assertEqual(delivered, [("/tmp/cc-socks/9.sock", "tok-9", "hello")])
+        self.assertIn("delivered via socket", err.getvalue())
+
+    def test_a_refused_socket_falls_back_to_typing(self):
+        self.record = self.inbox_record()
+        self.h.inbox_deliver = lambda path, token, text: False
+        typed = []
+        self.h.verified_send = lambda pane, text, settle, before: typed.append(
+            (pane, text)) or "sent"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = self.h.cmd_send(self.args())
+        self.assertEqual(code, 0)
+        self.assertEqual(typed, [("%4", "hello")])
+        self.assertIn("typed into pane", err.getvalue())
+
+    def test_a_record_without_an_inbox_types(self):
+        self.record = {"pane": "%4", "updated": 10}
+        typed = []
+        self.h.verified_send = lambda pane, text, settle, before: typed.append(
+            (pane, text)) or "sent"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = self.h.cmd_send(self.args())
+        self.assertEqual(code, 0)
+        self.assertEqual(typed, [("%4", "hello")])
+
+    def test_no_enter_keeps_the_typing_path(self):
+        # --no-enter asks for a draft; a socket delivery always submits
+        self.record = self.inbox_record()
+        typed = []
+        self.h.send_text = lambda pane, text, no_enter: typed.append(
+            (pane, text, no_enter))
+        with contextlib.redirect_stderr(io.StringIO()):
+            code = self.h.cmd_send(self.args(no_enter=True))
+        self.assertEqual(code, 0)
+        self.assertEqual(typed, [("%4", "hello", True)])
+
+    def test_json_names_the_path_that_delivered(self):
+        self.record = self.inbox_record()
+        self.h.inbox_deliver = lambda path, token, text: True
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = self.h.cmd_send(self.args(json=True))
+        self.assertEqual(code, 0)
+        result = json.loads(out.getvalue())["result"]
+        self.assertEqual(result["via"], "socket")
+        self.assertTrue(result["verified"])
+
+    def test_json_says_pane_when_the_socket_is_gone(self):
+        self.record = self.inbox_record()
+        self.h.inbox_deliver = lambda path, token, text: False
+        self.h.verified_send = lambda pane, text, settle, before: "sent"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = self.h.cmd_send(self.args(json=True))
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue())["result"]["via"], "pane")
+
+    def test_a_recorded_inbox_reaches_a_session_with_no_pane(self):
+        self.record = self.inbox_record(pane=None)
+        delivered = []
+        self.h.inbox_deliver = lambda path, token, text: delivered.append(text) or True
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = self.h.cmd_send(self.args())
+        self.assertEqual(code, 0)
+        self.assertEqual(delivered, ["hello"])
+
+    def test_no_pane_and_a_refused_socket_still_dies(self):
+        self.record = self.inbox_record(pane=None)
+        self.h.inbox_deliver = lambda path, token, text: False
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            self.h.cmd_send(self.args())
+        self.assertIn("has no pane", err.getvalue())
+
+    def test_ack_still_applies_after_a_socket_delivery(self):
+        self.record = self.inbox_record()
+        self.h.inbox_deliver = lambda path, token, text: True
+        self.h.wait_for_send_ack = lambda *args: False
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = self.h.cmd_send(self.args(ack=True))
+        self.assertEqual(code, 4)
+        self.assertIn("no hook acknowledgment arrived", err.getvalue())
+
+
+class InboxDeliverTest(unittest.TestCase):
+    """The wire protocol: auth frame first, then the user frame, NDJSON."""
+
+    def setUp(self):
+        self.h = _load_module()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def listener(self, name="in.sock"):
+        path = os.path.join(self.tmp.name, name)
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(path)
+        server.listen(1)
+        self.addCleanup(server.close)
+        frames = []
+
+        def serve():
+            conn, _ = server.accept()
+            with conn, conn.makefile("r") as fh:
+                for line in fh:
+                    frames.append(line)
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        return path, frames, thread
+
+    def test_writes_the_auth_frame_then_the_user_frame(self):
+        path, frames, thread = self.listener()
+        self.assertTrue(self.h.inbox_deliver(path, "tok-1", "hello there"))
+        thread.join(5)
+        self.assertEqual([json.loads(f) for f in frames], [
+            {"type": "auth", "token": "tok-1"},
+            {"type": "user", "message": {"role": "user",
+                                         "content": "hello there"}},
+        ])
+
+    def test_a_missing_socket_is_a_failure_not_a_crash(self):
+        self.assertFalse(self.h.inbox_deliver(
+            os.path.join(self.tmp.name, "gone.sock"), "tok", "hello"))
+
+    def test_a_stale_socket_file_that_refuses_is_a_failure(self):
+        # a dead session leaves its socket file behind; connect is refused
+        path = os.path.join(self.tmp.name, "stale.sock")
+        dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        dead.bind(path)
+        dead.close()
+        self.assertFalse(self.h.inbox_deliver(path, "tok", "hello"))
+
+    def test_no_token_is_a_failure_rather_than_an_unauthenticated_frame(self):
+        path, frames, thread = self.listener("notok.sock")
+        self.assertFalse(self.h.inbox_deliver(path, None, "hello"))
+        self.assertEqual(frames, [])
 
 
 class SpawnLineTest(unittest.TestCase):
